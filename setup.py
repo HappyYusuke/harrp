@@ -28,6 +28,7 @@ setup(
         'console_scripts': [
             f'reid3d = {package_name}.reid3d:main',
             f'pub_pillar_bbox = {package_name}.pub_pillar_bbox:main',
+            f'ground_removal = {package_name}.ground_removal:main',
         ],
     },
 )

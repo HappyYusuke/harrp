@@ -20,6 +20,11 @@ def generate_launch_description():
             output='screen'
         ),
         Node(
+            package='harrp',
+            executable='ground_removal', 
+            output='screen'
+        ),
+        Node(
             package='rviz2',
             executable='rviz2',
             name='rviz2',
