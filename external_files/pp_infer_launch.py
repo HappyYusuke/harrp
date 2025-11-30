@@ -31,6 +31,6 @@ def generate_launch_description():
                 'data_type': 'fp32',
                 'intensity_scale': 255.0,
             }],
-            remappings=[('/point_cloud', '/livox/lidar')]
+            remappings=[('/point_cloud', '/livox/lidar/no_ground')]
         )
     ])
