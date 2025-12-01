@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import sys
 import rclpy
@@ -183,3 +185,6 @@ def main():
         pass
     node.destroy_node()
     rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

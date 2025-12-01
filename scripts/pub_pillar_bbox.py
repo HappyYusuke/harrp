@@ -1,4 +1,4 @@
-# detection_visualizer.py という名前で保存してください
+#!/usr/bin/env python3
 
 import rclpy
 from rclpy.node import Node
@@ -58,9 +58,18 @@ class PubPillarBbox(Node):
         # MarkerArrayをパブリッシュ
         self.marker_publisher.publish(marker_array)
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = PubPillarBbox()
-    rclpy.spin(node)
-    visualizer_node.destroy_node()
-    rclpy.shutdown()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

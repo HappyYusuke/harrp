@@ -16,12 +16,12 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='harrp',
-            executable='pub_pillar_bbox', 
+            executable='pub_pillar_bbox.py', 
             output='screen'
         ),
         Node(
             package='harrp',
-            executable='ground_removal', 
+            executable='ground_removal_node', 
             output='screen'
         ),
         Node(
