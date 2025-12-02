@@ -18,7 +18,7 @@ def generate_launch_description():
     ground_removal_component = ComposableNode(
         package='harrp',
         plugin='harrp::GroundRemovalNode',
-        name='ground_removal_node',
+        name='ground_removalcomp_node',
         # プロセス内通信を有効化 (重要)
         extra_arguments=[{'use_intra_process_comms': True}]
     )

@@ -30,7 +30,7 @@ ament_target_dependencies(ground_removal_node
 # ---------------------------------------------------------
 # SHARED ライブラリとして追加します
 add_library(ground_removal_component SHARED
-  src/ground_removal_node.cpp
+  src/ground_removalcomp_node.cpp
 )
 
 target_compile_definitions(ground_removal_component
@@ -53,10 +53,12 @@ rclcpp_components_register_nodes(ground_removal_component
 # ---------------------------------------------------------
 # インストール設定
 # ---------------------------------------------------------
-install(TARGETS ground_removal_component
+install(TARGETS
+  ground_removal_component
+  ground_removal_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
 # Pythonスクリプト
