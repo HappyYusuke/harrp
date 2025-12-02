@@ -15,6 +15,17 @@ find_package(sensor_msgs REQUIRED)
 # find_package(pcl_conversions REQUIRED)
 
 # ---------------------------------------------------------
+# C++ノードのビルド
+# ---------------------------------------------------------
+# 実行ファイルとして定義
+add_executable(ground_removal_node src/ground_removal_node.cpp)
+
+ament_target_dependencies(ground_removal_node
+  rclcpp
+  sensor_msgs
+)
+
+# ---------------------------------------------------------
 # コンポーネント（ライブラリ）のビルド
 # ---------------------------------------------------------
 # SHARED ライブラリとして追加します
