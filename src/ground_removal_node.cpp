@@ -99,6 +99,14 @@ private:
 
 } // namespace harrp
 
-
-// main関数を削除し、コンポーネント登録マクロを追加
-RCLCPP_COMPONENTS_REGISTER_NODE(harrp::GroundRemovalNode)
+int main(int argc, char * argv[])
+{
+  rclcpp::init(argc, argv);
+  // namespaceが harrp、クラス名が GroundRemovalNode であると仮定しています
+  // コンストラクタの引数に合わせて調整が必要な場合がありますが、通常はこれで動きます
+  rclcpp::NodeOptions options;
+  auto node = std::make_shared<harrp::GroundRemovalNode>(options);
+  rclcpp::spin(node);
+  rclcpp::shutdown();
+  return 0;
+}
