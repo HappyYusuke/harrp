@@ -16,7 +16,7 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='harrp',
-            executable='reid3d', 
+            executable='reid3d.py', 
             output='screen'
         ),
         Node(
