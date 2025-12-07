@@ -2,41 +2,41 @@
 
 import os
 import sys
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2
-from visualization_msgs.msg import Marker
-from std_msgs.msg import ColorRGBA
-
-import ros2_numpy as rnp
+import collections
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-import collections
 
-# モデルとユーティリティ関数のインポート
+import rclpy
+from rclpy.node import Node
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import ColorRGBA
+from vision_msgs.msg import Detection3DArray
+
+import ros2_numpy as rnp
+
+# ============================
+# ReIDモデルのインポート
+# ============================
 HOME_DIR = os.environ['HOME']
 sys.path.insert(0, f'{HOME_DIR}/ReID3D/reidnet/')
 
-# ============================
-# parser対策
-# ============================
-"""
-from model import networkをするときに、parserがimportされros2 launchできないので、
-ROSの引数をoriginal_argvに隠し、import後にもとに戻す。
-"""
 original_argv = sys.argv
 sys.argv = [original_argv[0]]
-
 from model import network
-
 sys.argv = original_argv
-
 # ============================
 
-# normalize_point_cloud はクラスの状態に依存しないため、クラス外のヘルパー関数としておくのが適切
+def get_unique_rgb(id_val):
+    """IDに基づいて一意のRGB値を生成"""
+    np.random.seed(id_val)
+    rgb = np.random.rand(3)
+    rgb = rgb * 0.5 + 0.5 
+    return (rgb[0], rgb[1], rgb[2])
+
 def normalize_point_cloud(points, num_points=256):
-    # ... (この関数の内容は変更なし) ...
+    """点群の正規化"""
     if points.shape[0] == 0:
         return np.zeros((num_points, 3))
     centroid = np.mean(points, axis=0)
@@ -51,134 +51,222 @@ def normalize_point_cloud(points, num_points=256):
         normalized_points = np.vstack((points_centered, additional_points))
     return normalized_points
 
+class PersonTracker:
+    def __init__(self, track_id, initial_pos, size, orientation):
+        self.id = track_id
+        self.pos = initial_pos       
+        self.size = size             
+        self.orientation = orientation
+        
+        self.queue = collections.deque(maxlen=30) 
+        self.last_seen = time.time()
+        self.reid_result = "Gathering..."
+        self.person_id_int = -1 
+        
+        # ★追加: 最後にReID推論を行った時間
+        self.last_reid_time = 0.0
 
-class ReID3D_ROS2(Node):
+    def update(self, pos, points, size, orientation):
+        self.pos = pos
+        self.size = size
+        self.orientation = orientation
+        self.last_seen = time.time()
+        
+        norm_points = normalize_point_cloud(points, num_points=256)
+        self.queue.append(norm_points)
+
+class ReID3D_PointPillars(Node):
     def __init__(self):
-        super().__init__('reid3d_ros2')
+        super().__init__('reid3d_pointpillars')
 
-        # --- パラメータ設定 ---
-        self.ROI_X_RANGE = (0.5, 3.0)
-        self.ROI_Y_RANGE = (-0.5, 0.5)
-        self.ROI_Z_RANGE = (-0.2, 1.8)
-        self.MIN_POINTS_THRESHOLD = 10
+        # --- パラメータ ---
         self.SEQUENCE_LENGTH = 30
         self.SIMILARITY_THRESHOLD = 0.85
+        self.TRACK_DISTANCE_THRESH = 1.0
+        self.TRACK_TIMEOUT = 2.0
+        
+        # ★追加: ReID推論を行う間隔 (秒)
+        # ここを長くすると負荷が下がり遅延が減ります
+        self.REID_INTERVAL = 1.0 
 
-        # --- ROSインターフェース ---
-        self.create_subscription(PointCloud2, '/livox/lidar', self.callback, 10)
-        self.person_points_pub = self.create_publisher(PointCloud2, '/person_points', 10)
-        self.label_marker_pub = self.create_publisher(Marker, '/person_label', 10)
+        self.create_subscription(Detection3DArray, '/bbox', self.bbox_callback, 10)
+        self.marker_pub = self.create_publisher(MarkerArray, '/person_reid_markers', 10)
 
-        # --- Re-ID関連 ---
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.net = self._load_model()
-        self.point_cloud_queue = collections.deque(maxlen=self.SEQUENCE_LENGTH)
+        self.trackers = []
+        self.next_track_id = 0
         self.gallery = {}
         self.next_person_id = 0
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.net = self._load_model()
         
-        self.get_logger().info('初期化完了。推論待機中です...')
+        self.get_logger().info('ReID3D Node Started. Optimized for low latency.')
 
     def _load_model(self):
-        """モデルをロードして初期化する"""
-        net = torch.nn.DataParallel(network.reid3d(1024, num_class=222, stride=1))
-        weight = torch.load(f'{HOME_DIR}/ReID3D/reidnet/log/ckpt_best.pth')
-        net.load_state_dict(weight)
-        net.to(self.device)
-        net.eval()
-        self.get_logger().info('モデルの読み込みが完了しました。')
-        return net
-
-    def parse_point_cloud(self, msg):
-        """ROSのPointCloud2メッセージをNumPy配列に変換する"""
         try:
-            return rnp.point_cloud2.pointcloud2_to_xyz_array(msg)
+            net = torch.nn.DataParallel(network.reid3d(1024, num_class=222, stride=1))
+            weight_path = f'{HOME_DIR}/ReID3D/reidnet/log/ckpt_best.pth'
+            if not os.path.exists(weight_path):
+                self.get_logger().error(f"モデルファイルが見つかりません: {weight_path}")
+                sys.exit(1)
+            weight = torch.load(weight_path)
+            net.load_state_dict(weight)
+            net.to(self.device)
+            net.eval()
+            return net
         except Exception as e:
-            self.get_logger().error(f"PointCloudのパースに失敗: {e}")
-            return None
+            self.get_logger().error(f"モデル読み込みエラー: {e}")
+            sys.exit(1)
 
-    def extract_person_points(self, pc_data: np.ndarray):
-        """ROIに基づいて人物の点群を抽出する"""
-        mask = (pc_data[:, 0] >= self.ROI_X_RANGE[0]) & (pc_data[:, 0] <= self.ROI_X_RANGE[1]) & \
-               (pc_data[:, 1] >= self.ROI_Y_RANGE[0]) & (pc_data[:, 1] <= self.ROI_Y_RANGE[1]) & \
-               (pc_data[:, 2] >= self.ROI_Z_RANGE[0]) & (pc_data[:, 2] <= self.ROI_Z_RANGE[1])
-        return pc_data[mask]
+    def bbox_callback(self, msg: Detection3DArray):
+        current_time = time.time()
+        matched_tracker_indices = []
 
-    def perform_reid(self, query_feature: torch.Tensor):
-        """クエリ特徴量とギャラリーを比較し、IDを判定または新規登録する"""
-        if not self.gallery:
-            new_id = f"person_{self.next_person_id}"
-            self.gallery[new_id] = query_feature
-            self.next_person_id += 1
-            return f"NEW: {new_id}"
-        
-        max_similarity, best_match_id = -1.0, None
-        for person_id, gallery_feature in self.gallery.items():
-            similarity = F.cosine_similarity(query_feature.unsqueeze(0), gallery_feature.unsqueeze(0)).item()
-            if similarity > max_similarity:
-                max_similarity = similarity
-                best_match_id = person_id
-        
-        if max_similarity > self.SIMILARITY_THRESHOLD:
-            return f"ID: {best_match_id}\nSim: {max_similarity:.2f}"
-        else:
-            new_id = f"person_{self.next_person_id}"
-            self.gallery[new_id] = query_feature
-            self.next_person_id += 1
-            return f"NEW: {new_id}"
+        for detection in msg.detections:
+            bbox = detection.bbox
+            center = np.array([bbox.center.position.x, bbox.center.position.y, bbox.center.position.z])
+            size = np.array([bbox.size.x, bbox.size.y, bbox.size.z])
+            orientation = bbox.center.orientation
 
-    def publish_visualizations(self, points: np.ndarray, text: str, header):
-        """検出した点群とIDラベルをrviz2にパブリッシュする"""
-        # 1. 色付き点群のパブリッシュ
-        colored_points = np.zeros(points.shape[0], dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('r', 'u1'), ('g', 'u1'), ('b', 'u1')])
-        colored_points['x'], colored_points['y'], colored_points['z'] = points[:, 0], points[:, 1], points[:, 2]
-        colored_points['r'], colored_points['g'], colored_points['b'] = 0, 255, 0 # Green
-        pc2_msg = rnp.point_cloud2.array_to_pointcloud2(colored_points, stamp=header.stamp, frame_id=header.frame_id)
-        self.person_points_pub.publish(pc2_msg)
+            # 点群取得
+            if detection.source_cloud.width * detection.source_cloud.height == 0:
+                continue
+            try:
+                cloud_arr = rnp.point_cloud2.pointcloud2_to_xyz_array(detection.source_cloud)
+            except Exception:
+                continue
+            if cloud_arr.shape[0] < 10:
+                continue
 
-        # 2. テキストマーカーのパブリッシュ
-        marker = Marker(header=header, ns="person_reid", id=0, type=Marker.TEXT_VIEW_FACING, action=Marker.ADD)
-        text_position = np.mean(points, axis=0)
-        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = float(text_position[0]), float(text_position[1]), float(text_position[2]) + 0.5
-        marker.pose.orientation.w = 1.0
-        marker.text, marker.scale.z = text, 0.2
-        marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-        marker.lifetime = rclpy.duration.Duration(seconds=2.0).to_msg()
-        self.label_marker_pub.publish(marker)
+            # トラッキング (位置合わせ)
+            best_idx = -1
+            min_dist = self.TRACK_DISTANCE_THRESH
 
-    def callback(self, msg: PointCloud2):
-        """メインのコールバック関数。各メソッドを呼び出して処理を調整する。"""
-        pc_data = self.parse_point_cloud(msg)
-        if pc_data is None:
-            return
-
-        person_points = self.extract_person_points(pc_data)
-        if person_points.shape[0] < self.MIN_POINTS_THRESHOLD:
-            self.point_cloud_queue.clear()
-            return
+            for i, tracker in enumerate(self.trackers):
+                if i in matched_tracker_indices:
+                    continue
+                dist = np.linalg.norm(tracker.pos - center)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_idx = i
             
-        normalized_frame = normalize_point_cloud(person_points, num_points=256)
-        self.point_cloud_queue.append(normalized_frame)
+            if best_idx != -1:
+                # 既存トラッカー更新
+                # ★ここが重要: 位置(pos)は毎フレーム更新されるため、描画はスムーズになります
+                self.trackers[best_idx].update(center, cloud_arr, size, orientation)
+                matched_tracker_indices.append(best_idx)
+                target_tracker = self.trackers[best_idx]
+            else:
+                # 新規作成
+                new_tracker = PersonTracker(self.next_track_id, center, size, orientation)
+                new_tracker.update(center, cloud_arr, size, orientation)
+                self.trackers.append(new_tracker)
+                self.next_track_id += 1
+                target_tracker = new_tracker
 
-        if len(self.point_cloud_queue) < self.SEQUENCE_LENGTH:
-            self.publish_visualizations(person_points, "Gathering data...", msg.header)
-            return
+            # --- ReID推論判定 ---
+            # 1. データが溜まっていること
+            # 2. 前回の推論から一定時間(REID_INTERVAL)経過していること
+            # 3. または、まだIDが確定していない(Gathering...)場合は優先的に実行してもよい
+            is_ready = len(target_tracker.queue) == self.SEQUENCE_LENGTH
+            time_elapsed = (current_time - target_tracker.last_reid_time) > self.REID_INTERVAL
+            is_unknown = target_tracker.person_id_int == -1
 
-        sequence_np = np.array(self.point_cloud_queue)
+            if is_ready and (time_elapsed or is_unknown):
+                self.run_reid_inference(target_tracker, current_time)
+
+        self.trackers = [t for t in self.trackers if (current_time - t.last_seen) < self.TRACK_TIMEOUT]
+        self.publish_markers(msg.header)
+
+    def run_reid_inference(self, tracker, current_time):
+        sequence_np = np.array(tracker.queue)
         tensor = torch.from_numpy(sequence_np).float()
         input_tensor = tensor.unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             output = self.net(input_tensor)
-        
         query_feature = output['val_bn'][0]
-        display_text = self.perform_reid(query_feature)
-        
-        self.publish_visualizations(person_points, display_text, msg.header)
 
-# main関数 (変更なし)
+        # 最後に推論した時間を更新
+        tracker.last_reid_time = current_time
+
+        if not self.gallery:
+            self._register_new_person(tracker, query_feature)
+            return
+
+        max_sim = -1.0
+        best_id_str = None
+        best_id_int = -1
+        
+        for pid_str, (feat, pid_int) in self.gallery.items():
+            sim = F.cosine_similarity(query_feature.unsqueeze(0), feat.unsqueeze(0)).item()
+            if sim > max_sim:
+                max_sim = sim
+                best_id_str = pid_str
+                best_id_int = pid_int
+        
+        if max_sim > self.SIMILARITY_THRESHOLD:
+            tracker.reid_result = f"{best_id_str}\n({max_sim:.2f})"
+            tracker.person_id_int = best_id_int
+        else:
+            self._register_new_person(tracker, query_feature)
+
+    def _register_new_person(self, tracker, feature):
+        new_id_str = f"Person_{self.next_person_id}"
+        self.gallery[new_id_str] = (feature, self.next_person_id)
+        tracker.reid_result = f"{new_id_str}\n(New)"
+        tracker.person_id_int = self.next_person_id
+        self.next_person_id += 1
+
+    def publish_markers(self, header):
+        marker_array = MarkerArray()
+        for tracker in self.trackers:
+            if tracker.person_id_int == -1:
+                r, g, b = 1.0, 1.0, 1.0
+                box_alpha = 0.3
+            else:
+                r, g, b = get_unique_rgb(tracker.person_id_int)
+                box_alpha = 0.5
+
+            # Box
+            box_marker = Marker()
+            box_marker.header = header
+            box_marker.ns = "reid_box"
+            box_marker.id = tracker.id
+            box_marker.type = Marker.CUBE
+            box_marker.action = Marker.ADD
+            box_marker.pose.position.x = tracker.pos[0]
+            box_marker.pose.position.y = tracker.pos[1]
+            box_marker.pose.position.z = tracker.pos[2]
+            box_marker.pose.orientation = tracker.orientation
+            box_marker.scale.x = tracker.size[0]
+            box_marker.scale.y = tracker.size[1]
+            box_marker.scale.z = tracker.size[2]
+            box_marker.color = ColorRGBA(r=float(r), g=float(g), b=float(b), a=box_alpha)
+            box_marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
+            marker_array.markers.append(box_marker)
+
+            # Text
+            text_marker = Marker()
+            text_marker.header = header
+            text_marker.ns = "reid_text"
+            text_marker.id = tracker.id
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            text_marker.pose.position.x = tracker.pos[0]
+            text_marker.pose.position.y = tracker.pos[1]
+            text_marker.pose.position.z = tracker.pos[2] + (tracker.size[2] / 2.0) + 0.5
+            text_marker.scale.z = 0.3
+            text_marker.color = ColorRGBA(r=float(r), g=float(g), b=float(b), a=1.0)
+            text_marker.text = tracker.reid_result
+            text_marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
+            marker_array.markers.append(text_marker)
+            
+        self.marker_pub.publish(marker_array)
+
 def main():
     rclpy.init()
-    node = ReID3D_ROS2()
+    node = ReID3D_PointPillars()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
