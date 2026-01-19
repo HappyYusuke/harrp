@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import time
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
@@ -23,6 +24,9 @@ class PubPillarBbox(Node):
         self.marker_publisher = self.create_publisher(MarkerArray, '/detections/markers', 10)
 
     def detection_callback(self, msg: Detection3DArray):
+    	# 処理速度計測用
+    	start_time = time.perf_counter()
+    
         marker_array = MarkerArray()
         
         # 検出された各オブジェクトに対してマーカーを作成
@@ -57,6 +61,11 @@ class PubPillarBbox(Node):
             
         # MarkerArrayをパブリッシュ
         self.marker_publisher.publish(marker_array)
+        
+        # 処理速度計測用
+        end_time = time.perf_counter()
+        elapsed_ms = (end_time - start_time) * 1000
+        self.get_logger().info(f'Processing time: {elapsed_ms:.3f} ms')
 
 
 def main(args=None):

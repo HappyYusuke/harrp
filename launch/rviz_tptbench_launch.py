@@ -14,11 +14,20 @@ def generate_launch_description():
     namespace = 'harrp'
 
     return LaunchDescription([
-        #Node(
-        #    package='harrp',
-        #    executable='reid3d.py', 
-        #    output='screen'
-        #),
+        Node(
+            package='image_transport',
+            executable='republish', 
+            name='republish',
+            output='screen',
+            arguments=[
+                'compressed',
+                'raw'
+            ],
+            remappings=[
+                ('in/compressed', '/camera/color/image_raw/compressed'),
+                ('out', '/camera/color/image_raw')
+            ]
+        ),
         Node(
             package='rviz2',
             executable='rviz2',

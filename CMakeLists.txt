@@ -65,6 +65,8 @@ install(TARGETS
 install(PROGRAMS
   scripts/pub_pillar_bbox.py
   scripts/reid3d.py
+  scripts/tpt_reid3d.py
+  scripts/tpt2_reid3d.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

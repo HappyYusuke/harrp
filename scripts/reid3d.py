@@ -147,6 +147,9 @@ class PersonTrackerReIDNode(Node):
                 self.get_logger().warn('Cannot track: No user registered.')
 
     def bbox_callback(self, msg: Detection3DArray):
+        # 処理速度計測用
+        #start_cb_time = time.time()
+
         current_time = time.time()
         
         # 1. 前処理: Detectionリストの作成
@@ -173,6 +176,15 @@ class PersonTrackerReIDNode(Node):
 
         # 3. 可視化
         self.publish_visualization(msg.header)
+
+        # 処理速度計測用
+        #if self.device.type == 'cuda':
+        #    torch.cuda.synchronize()
+        #end_cb_time = time.time()
+        #elapsed_ms = (end_cb_time - start_cb_time) * 1000.0
+
+        #self.get_logger().info(f'Total CB Time: {elapsed_ms:.2f} ms')
+
 
     def process_registration(self, detections, current_time):
         """登録フェーズ"""
