@@ -60,91 +60,142 @@ def get_yaw_from_orientation(q):
     cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
-# ==========================================
-# UKF用の関数定義 (状態遷移関数と観測関数)
-# ==========================================
+class ParticleFilterTracker(object):
+    def __init__(self, initial_pos, num_particles=200):
+        """
+        initial_pos: [x, y, z]
+        num_particles: 粒子の数 (多いほど高精度だが重くなる。Pythonなら100~300推奨)
+        """
+        self.num_particles = num_particles
+        
+        # ----------------------------------------------------
+        # 1. 粒子の初期化 (Initialization)
+        # ----------------------------------------------------
+        # 状態: [x, y, z, vx, vy, vz] (6次元)
+        # 初期位置の周りにガウス分布で粒子をばら撒く
+        self.particles = np.zeros((num_particles, 6))
+        
+        # 位置(x,y,z)には少しノイズを乗せる
+        self.particles[:, 0] = initial_pos[0] + np.random.randn(num_particles) * 0.1
+        self.particles[:, 1] = initial_pos[1] + np.random.randn(num_particles) * 0.1
+        self.particles[:, 2] = initial_pos[2] + np.random.randn(num_particles) * 0.05
+        
+        # 速度(vx,vy,vz)は初期値0だが、少しばらつきを持たせる
+        self.particles[:, 3:6] = np.random.randn(num_particles, 3) * 0.1
 
-def fx(x, dt):
-    """
-    状態遷移関数 (State Transition Function)
-    等速直線運動モデル:
-    位置 = 位置 + 速度 * dt
-    速度 = 速度 (変化なし)
-    x: [x, y, z, vx, vy, vz]
-    """
-    F = np.eye(6)
-    F[0, 3] = dt
-    F[1, 4] = dt
-    F[2, 5] = dt
-    return np.dot(F, x)
-
-def hx(x):
-    """
-    観測関数 (Measurement Function)
-    センサー(LiDAR)は位置(x, y, z)のみを観測する
-    """
-    return x[:3]
-
-# ==========================================
-# KalmanBoxTracker (UKF版)
-# ==========================================
-
-class KalmanBoxTracker(object):
-    def __init__(self, initial_pos):
-        # シグマ点の生成設定
-        # n=6 (状態変数の次元数), alpha, beta, kappaは一般的な推奨値
-        points = MerweScaledSigmaPoints(n=6, alpha=0.1, beta=2., kappa=0.)
-
-        # UKFの初期化
-        # dim_x=6 (x,y,z,vx,vy,vz), dim_z=3 (x,y,z)
-        self.ukf = UKF(dim_x=6, dim_z=3, dt=0.1, fx=fx, hx=hx, points=points)
-
-        # 初期状態の設定
-        self.ukf.x = np.array([initial_pos[0], initial_pos[1], initial_pos[2], 0, 0, 0])
-
-        # 共分散行列 P (初期の不確かさ)
-        self.ukf.P *= 1.0
-
-        # ★プロセスノイズ Q (モデルの不確かさ)
-        # ここを小さくすると「等速直線運動」を強く信じるようになります
-        # すれ違い対策には小さめ (0.01~0.05) が推奨
-        self.ukf.Q = np.eye(6) * 0.05
-
-        # ★観測ノイズ R (センサーの不確かさ)
-        # ここを大きくすると「観測値（他人の位置）」に飛びつきにくくなります
-        # すれ違い対策には大きめ (2.0~5.0) が推奨
-        self.ukf.R = np.eye(3) * 5.0
-
+        # 重みの初期化 (すべて均等)
+        self.weights = np.ones(num_particles) / num_particles
+        
         self.last_timestamp = None
         
-        # 外部参照用 (互換性のため)
-        self.x = self.ukf.x
+        # 推定値 (Estimate) - 外部参照用
+        self.x = np.zeros(6)
+        self.x[:3] = initial_pos
+
+        # --- パラメータ調整 ---
+        # プロセスノイズ (予測時の広がり): 大きいと予測がボヤける、小さいと急な動きに遅れる
+        self.process_noise_pos = 0.05  # 位置のバラつき
+        self.process_noise_vel = 0.1   # 速度のバラつき
+        
+        # 観測ノイズ (尤度計算用): 大きいと観測を信用しない、小さいと過敏に反応
+        # すれ違い対策には「少し大きめ」にして、外れ値(他人)に反応しすぎないようにする
+        self.measurement_noise_std = 0.5 
 
     def predict(self, current_time):
         if self.last_timestamp is None:
-            dt = 0.1 # 初回用ダミー
+            dt = 0.1
         else:
             dt = current_time - self.last_timestamp
-        
         self.last_timestamp = current_time
+
+        # ----------------------------------------------------
+        # 2. 予測 (Prediction) - 全粒子を一気に計算
+        # ----------------------------------------------------
+        # 等速直線運動モデル: x = x + vx * dt
+        self.particles[:, 0] += self.particles[:, 3] * dt
+        self.particles[:, 1] += self.particles[:, 4] * dt
+        self.particles[:, 2] += self.particles[:, 5] * dt
         
-        # UKFの予測ステップ
-        self.ukf.predict(dt=dt)
+        # プロセスノイズの付加 (拡散させる)
+        # これがないと、粒子が一点に収束して動かなくなってしまう
+        self.particles[:, :3] += np.random.randn(self.num_particles, 3) * self.process_noise_pos
+        self.particles[:, 3:] += np.random.randn(self.num_particles, 3) * self.process_noise_vel
         
-        # 参照用変数の更新
-        self.x = self.ukf.x
+        # 推定値の更新 (重み付き平均)
+        self.estimate()
         
-        # 予測位置 (x, y, z) を返す
-        return self.ukf.x[:3]
+        return self.x[:3]
 
     def update(self, measurement):
-        # measurement: numpy array [x, y, z]
+        """
+        measurement: [x, y, z] の観測値
+        """
+        # ----------------------------------------------------
+        # 3. 更新 (Update) - 尤度の計算
+        # ----------------------------------------------------
+        # 各粒子と観測値との距離を計算
+        # dists: shape (num_particles,)
+        dists = np.linalg.norm(self.particles[:, :3] - measurement, axis=1)
         
-        # UKFの更新ステップ
-        self.ukf.update(measurement)
+        # ガウス分布に基づく尤度 (Likelihood)
+        # 観測値に近い粒子ほど重みが大きくなる
+        # P(z|x) ~ exp(-dist^2 / (2 * sigma^2))
+        likelihood = np.exp(-0.5 * (dists / self.measurement_noise_std) ** 2)
         
-        # 参照用変数の更新
-        self.x = self.ukf.x
+        # ゼロ除算防止 (すべての粒子の重みが0にならないように)
+        if np.sum(likelihood) == 0:
+            likelihood[:] = 1.0 / self.num_particles
+            
+        # 重みの更新
+        self.weights *= likelihood
+        self.weights += 1.e-300 # アンダーフロー防止
+        self.weights /= np.sum(self.weights) # 正規化 (合計を1にする)
+
+        # ----------------------------------------------------
+        # 4. 推定 (Estimation)
+        # ----------------------------------------------------
+        self.estimate()
+        
+        # ----------------------------------------------------
+        # 5. リサンプリング (Resampling)
+        # ----------------------------------------------------
+        self.resample()
+
+    def estimate(self):
+        """粒子の重み付き平均を計算して、現在の推定値とする"""
+        self.x = np.average(self.particles, weights=self.weights, axis=0)
+
+    def resample(self):
+        """
+        重みの低い粒子を捨て、重みの高い粒子を増殖させる
+        """
+        # 有効粒子数 (N_eff) の計算
+        n_eff = 1.0 / np.sum(self.weights**2)
+        
+        # リサンプリングの閾値 (粒子数の半分以下になったら実行)
+        if n_eff < self.num_particles / 2.0:
+            # 系統的リサンプリング (Systematic Resampling) - 計算が速い
+            indices = self.systematic_resample(self.weights)
+            
+            # 粒子のコピーと入れ替え
+            self.particles[:] = self.particles[indices]
+            # 重みをリセット
+            self.weights[:] = 1.0 / self.num_particles
+
+    def systematic_resample(self, weights):
+        """系統的リサンプリングの実装"""
+        N = len(weights)
+        positions = (np.arange(N) + np.random.random()) / N
+        indexes = np.zeros(N, 'i')
+        cumulative_sum = np.cumsum(weights)
+        i, j = 0, 0
+        while i < N:
+            if positions[i] < cumulative_sum[j]:
+                indexes[i] = j
+                i += 1
+            else:
+                j += 1
+        return indexes
 
 # ==========================================
 
@@ -157,7 +208,7 @@ class Candidate:
         self.queue.append(initial_points)
         self.last_sim = 0.0
         
-        self.kf = KalmanBoxTracker(pos)
+        self.kf = ParticleFilterTracker(pos, num_particles=200)
         self.pos = pos 
         self.pred_pos = pos 
         self.last_seen_time = time.time()
