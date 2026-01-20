@@ -24,7 +24,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA, String
 from vision_msgs.msg import Detection3DArray
-from geometry_msgs.msg import PoseStamped
+# ★追加: Point をインポート
+from geometry_msgs.msg import PoseStamped, Point
 
 import ros2_numpy as rnp
 
@@ -78,9 +79,9 @@ class ParticleFilterTracker(object):
         self.x[:3] = initial_pos
         
         # パラメータ (PF用)
-        self.process_noise_pos = 0.01
-        self.process_noise_vel = 0.3 # 人間用に少し大きく
-        self.measurement_noise_std = 0.4 
+        self.process_noise_pos = 0.05
+        self.process_noise_vel = 0.1 # 人間用に少し大きく
+        self.measurement_noise_std = 0.2
 
     def predict(self, current_time):
         if self.last_timestamp is None:
@@ -165,7 +166,6 @@ class KalmanBoxTracker(object):
         self.kf.P *= 1.0 
         self.kf.P[3:, 3:] *= 10.0
         
-        # すれ違い対策チューニング
         sensor_noise_std = 0.5  
         self.kf.R = np.diag([sensor_noise_std, sensor_noise_std, sensor_noise_std]) ** 2 
         self.kf.Q = np.eye(6) * 0.05**2
@@ -199,7 +199,6 @@ class Candidate:
         self.feature_gallery = collections.deque(maxlen=100)
         self.algo = algo
         
-        # ★アルゴリズム切り替え
         if self.algo == "PF":
             self.kf = ParticleFilterTracker(pos, num_particles=500)
         else:
@@ -215,13 +214,10 @@ class Candidate:
 
     def update_state(self, pos, size, orientation):
         self.kf.update(pos)
-        
-        # 位置取得の仕方がクラスによって異なるため吸収
         if self.algo == "PF":
             self.pos = self.kf.x[:3]
         else:
             self.pos = self.kf.kf.x[:3]
-            
         self.size = size
         self.orientation = orientation
         self.last_seen_time = time.time()
@@ -246,8 +242,7 @@ class PersonTrackerClickInitNode(Node):
         super().__init__('person_tracker_click_init')
         self.declare_parameter('max_missing_time', 1.0)
         self.declare_parameter('reid_sim_thresh', 0.80)
-        # ★追加: アルゴリズム切り替えパラメータ
-        self.declare_parameter('tracking_algo', 'PF') 
+        self.declare_parameter('tracking_algo', 'PF') # デフォルトをPFにしておきます 
         
         self.MAX_MISSING_TIME = self.get_parameter('max_missing_time').value
         self.REID_SIM_THRESH = self.get_parameter('reid_sim_thresh').value
@@ -286,7 +281,6 @@ class PersonTrackerClickInitNode(Node):
         self.next_candidate_id = 0
         self.json_results = {}
         
-        # 非同期処理用
         self.reid_thread = None
         self.is_reid_running = False
         self.reid_lock = threading.Lock()
@@ -334,9 +328,6 @@ class PersonTrackerClickInitNode(Node):
             feature = F.normalize(feature.unsqueeze(0), p=2, dim=1).squeeze(0)
         return feature
 
-    # =========================================================
-    # 非同期ReIDワーカー
-    # =========================================================
     def async_reid_worker(self, target_cand, points_seq, mode="UPDATE"):
         try:
             feature = self.extract_feature_single(points_seq)
@@ -370,8 +361,6 @@ class PersonTrackerClickInitNode(Node):
             self.get_logger().error(f"Async ReID Error: {e}")
         finally:
             self.is_reid_running = False
-
-    # =========================================================
 
     def goal_callback(self, msg: PoseStamped):
         click_x = msg.pose.position.x
@@ -450,22 +439,13 @@ class PersonTrackerClickInitNode(Node):
             if ratio > 5.0: 
                 continue
 
-            # (C) ★変更: ポール対策 (形状チェックのみ)
-            # サイズに関わらず、形状が「真円」に近すぎる(表面が滑らかすぎる)ものを弾く
-            
-            # 重心からの距離(半径)を計算
+            # (C) ポール対策: 形状チェックのみ
             dists_from_center = np.linalg.norm(centered_xy, axis=1)
-            
-            # 半径の標準偏差 (凹凸具合)
             std_radial = np.std(dists_from_center)
-            
-            # 人間は凹凸があるため 0.05 以上になることが多い
-            # 0.04未満ということは、非常に綺麗な円筒形（ポール）である可能性が高い
             if std_radial < 0.04: 
-                continue
-                    
+                continue 
             # =========================================================
-            
+
             norm_points = normalize_point_cloud(raw_points, num_points=256)
             bbox = detection.bbox
             pos = np.array([bbox.center.position.x, bbox.center.position.y, bbox.center.position.z])
@@ -526,7 +506,6 @@ class PersonTrackerClickInitNode(Node):
             if i not in matched_det_indices:
                 nid = self.next_candidate_id
                 self.next_candidate_id += 1
-                # ★追加: ここでTRACKING_ALGOを渡す
                 self.candidates[nid] = Candidate(nid, det['pos'], det['size'], det['ori'], det['points'], algo=self.TRACKING_ALGO)
                 active_ids.add(nid)
         self.candidates = {k: v for k, v in self.candidates.items() if k in active_ids}
@@ -695,6 +674,27 @@ class PersonTrackerClickInitNode(Node):
                 mk.scale.x = mk.scale.y = mk.scale.z = 0.5
                 mk.color = ColorRGBA(r=0.7, g=0.7, b=0.7, a=0.3) 
             marker_array.markers.append(mk)
+            
+            # ★追加: ターゲットのみパーティクル描画 (PFの場合)
+            if cand.algo == 'PF' and is_target:
+                p_mk = Marker()
+                p_mk.header = header
+                p_mk.ns = f"particles_{cid}"
+                p_mk.id = cid
+                p_mk.type = Marker.POINTS
+                p_mk.action = Marker.ADD
+                p_mk.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
+                p_mk.scale.x = 0.03
+                p_mk.scale.y = 0.03
+                p_mk.color = ColorRGBA(r=0.0, g=0.0, b=1.0, a=0.5)
+                for p in cand.kf.particles:
+                    pt = Point()
+                    pt.x = float(p[0])
+                    pt.y = float(p[1])
+                    pt.z = float(p[2])
+                    p_mk.points.append(pt)
+                marker_array.markers.append(p_mk)
+                
             text = Marker()
             text.header = header
             text.ns = "text"
@@ -717,7 +717,6 @@ class PersonTrackerClickInitNode(Node):
             if is_target and not self.feature_locked: 
                 label += f"\nInit:{self.captured_frames_count}/30"
             
-            # アルゴリズムの表示 (デバッグ用)
             label += f"\n[{cand.algo}]"
             
             text.text = label
