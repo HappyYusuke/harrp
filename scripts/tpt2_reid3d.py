@@ -12,7 +12,7 @@ import json
 import cv2 
 import glob
 import bisect
-import threading  # ★追加: 非同期処理用
+import threading
 
 # --- FilterPy Imports ---
 from filterpy.kalman import UnscentedKalmanFilter as UKF
@@ -59,12 +59,92 @@ def normalize_point_cloud(points, num_points=256):
     return normalized_points
 
 # ==========================================
-# UKF Functions & Class
+# 1. Particle Filter Implementation
 # ==========================================
+class ParticleFilterTracker(object):
+    def __init__(self, initial_pos, num_particles=300):
+        self.num_particles = num_particles
+        self.particles = np.zeros((num_particles, 6))
+        
+        # 初期化: ガウス分布で散らす
+        self.particles[:, 0] = initial_pos[0] + np.random.randn(num_particles) * 0.1
+        self.particles[:, 1] = initial_pos[1] + np.random.randn(num_particles) * 0.1
+        self.particles[:, 2] = initial_pos[2] + np.random.randn(num_particles) * 0.05
+        self.particles[:, 3:6] = np.random.randn(num_particles, 3) * 0.1
+        
+        self.weights = np.ones(num_particles) / num_particles
+        self.last_timestamp = None
+        self.x = np.zeros(6)
+        self.x[:3] = initial_pos
+        
+        # パラメータ (PF用)
+        self.process_noise_pos = 0.01
+        self.process_noise_vel = 0.3 # 人間用に少し大きく
+        self.measurement_noise_std = 0.4 
 
+    def predict(self, current_time):
+        if self.last_timestamp is None:
+            dt = 0.1
+        else:
+            dt = current_time - self.last_timestamp
+        self.last_timestamp = current_time
+        
+        # 等速直線運動
+        self.particles[:, 0] += self.particles[:, 3] * dt
+        self.particles[:, 1] += self.particles[:, 4] * dt
+        self.particles[:, 2] += self.particles[:, 5] * dt
+        
+        # プロセスノイズ拡散
+        self.particles[:, :3] += np.random.randn(self.num_particles, 3) * self.process_noise_pos
+        self.particles[:, 3:] += np.random.randn(self.num_particles, 3) * self.process_noise_vel
+        
+        self.estimate()
+        return self.x[:3]
+
+    def update(self, measurement):
+        dists = np.linalg.norm(self.particles[:, :3] - measurement, axis=1)
+        # 尤度計算
+        likelihood = np.exp(-0.5 * (dists / self.measurement_noise_std) ** 2)
+        
+        if np.sum(likelihood) == 0:
+            likelihood[:] = 1.0 / self.num_particles
+            
+        self.weights *= likelihood
+        self.weights += 1.e-300
+        self.weights /= np.sum(self.weights)
+        
+        self.estimate()
+        self.resample()
+
+    def estimate(self):
+        self.x = np.average(self.particles, weights=self.weights, axis=0)
+
+    def resample(self):
+        n_eff = 1.0 / np.sum(self.weights**2)
+        if n_eff < self.num_particles / 2.0:
+            indices = self.systematic_resample(self.weights)
+            self.particles[:] = self.particles[indices]
+            self.weights[:] = 1.0 / self.num_particles
+
+    def systematic_resample(self, weights):
+        N = len(weights)
+        positions = (np.arange(N) + np.random.random()) / N
+        indexes = np.zeros(N, 'i')
+        cumulative_sum = np.cumsum(weights)
+        i, j = 0, 0
+        while i < N:
+            if positions[i] < cumulative_sum[j]:
+                indexes[i] = j
+                i += 1
+            else:
+                j += 1
+        return indexes
+
+# ==========================================
+# 2. Unscented Kalman Filter Implementation
+# ==========================================
 def fx(x, dt):
-    """ 状態遷移関数: 等速直線運動モデル """
-    # x: [x, y, z, vx, vy, vz]
+    """ UKF 状態遷移関数 """
     F = np.eye(6, dtype=float)
     F[0, 3] = dt
     F[1, 4] = dt
@@ -72,37 +152,24 @@ def fx(x, dt):
     return np.dot(F, x)
 
 def hx(x):
-    """ 観測関数: 状態から位置(x,y,z)を取り出す """
+    """ UKF 観測関数 """
     return x[:3]
 
 class KalmanBoxTracker(object):
     def __init__(self, initial_pos):
-        # ... (シグマポイントの設定などはそのまま) ...
         points = MerweScaledSigmaPoints(n=6, alpha=0.1, beta=2.0, kappa=-3) 
         self.kf = UKF(dim_x=6, dim_z=3, dt=0.1, fx=fx, hx=hx, points=points)
         
         self.kf.x[:3] = initial_pos
         self.kf.x[3:] = 0
-        
         self.kf.P *= 1.0 
         self.kf.P[3:, 3:] *= 10.0
         
-        # ==========================================
-        # ★チューニング箇所: すれ違いに強くする設定
-        # ==========================================
-        
-        # 1. 観測ノイズ (R): 少し大きくして、センサの一時的なブレや融合を無視させる
-        # デフォルト 0.1 -> 0.5 くらいまで上げると、軌道が滑らかになり吸着しにくくなる
-        sensor_noise_std = 0.3
+        # すれ違い対策チューニング
+        sensor_noise_std = 0.5  
         self.kf.R = np.diag([sensor_noise_std, sensor_noise_std, sensor_noise_std]) ** 2 
-        
-        # 2. プロセスノイズ (Q): 速度の変化(急ターン・急停止)をあまり許容しないようにする
-        # 等速直線運動モデルを強く信じさせる
         self.kf.Q = np.eye(6) * 0.05**2
-        
-        # 以前は *= 20 でしたが、これを小さくすると「慣性」が強くなります。
-        # すれ違い重視なら 1.0 〜 5.0 程度推奨。
-        self.kf.Q[3:, 3:] *= 0.1
+        self.kf.Q[3:, 3:] *= 2.0 
         
         self.last_timestamp = None
 
@@ -122,7 +189,7 @@ class KalmanBoxTracker(object):
 # ==========================================
 
 class Candidate:
-    def __init__(self, id, pos, size, orientation, initial_points):
+    def __init__(self, id, pos, size, orientation, initial_points, algo="UKF"):
         self.id = id
         self.size = size
         self.orientation = orientation
@@ -130,8 +197,13 @@ class Candidate:
         self.queue.append(initial_points)
         self.last_sim = 0.0
         self.feature_gallery = collections.deque(maxlen=100)
+        self.algo = algo
         
-        self.kf = KalmanBoxTracker(pos)
+        # ★アルゴリズム切り替え
+        if self.algo == "PF":
+            self.kf = ParticleFilterTracker(pos, num_particles=500)
+        else:
+            self.kf = KalmanBoxTracker(pos)
         
         self.pos = pos 
         self.pred_pos = pos 
@@ -143,7 +215,13 @@ class Candidate:
 
     def update_state(self, pos, size, orientation):
         self.kf.update(pos)
-        self.pos = self.kf.kf.x[:3] 
+        
+        # 位置取得の仕方がクラスによって異なるため吸収
+        if self.algo == "PF":
+            self.pos = self.kf.x[:3]
+        else:
+            self.pos = self.kf.kf.x[:3]
+            
         self.size = size
         self.orientation = orientation
         self.last_seen_time = time.time()
@@ -168,8 +246,14 @@ class PersonTrackerClickInitNode(Node):
         super().__init__('person_tracker_click_init')
         self.declare_parameter('max_missing_time', 1.0)
         self.declare_parameter('reid_sim_thresh', 0.80)
+        # ★追加: アルゴリズム切り替えパラメータ
+        self.declare_parameter('tracking_algo', 'PF') 
+        
         self.MAX_MISSING_TIME = self.get_parameter('max_missing_time').value
         self.REID_SIM_THRESH = self.get_parameter('reid_sim_thresh').value
+        self.TRACKING_ALGO = self.get_parameter('tracking_algo').value
+        
+        self.get_logger().info(f"Tracking Algorithm: {self.TRACKING_ALGO}")
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.net = self._load_model()
@@ -202,7 +286,7 @@ class PersonTrackerClickInitNode(Node):
         self.next_candidate_id = 0
         self.json_results = {}
         
-        # ★追加: 非同期処理管理用フラグとロック
+        # 非同期処理用
         self.reid_thread = None
         self.is_reid_running = False
         self.reid_lock = threading.Lock()
@@ -231,7 +315,6 @@ class PersonTrackerClickInitNode(Node):
             sys.exit(1)
 
     def extract_feature_single(self, points_sequence):
-        # ネットワーク推論を行う関数（重い処理）
         if len(points_sequence) < 1: 
             return None
         input_seq = list(points_sequence)
@@ -252,37 +335,26 @@ class PersonTrackerClickInitNode(Node):
         return feature
 
     # =========================================================
-    # ★追加: 非同期ReIDワーカー関数
+    # 非同期ReIDワーカー
     # =========================================================
     def async_reid_worker(self, target_cand, points_seq, mode="UPDATE"):
-        """
-        別スレッドで実行される推論処理
-        mode: "INIT" (初期登録), "UPDATE" (追跡中の更新), "RECOVERY" (リカバリー探索)
-        """
         try:
-            # 推論実行 (ここで0.1〜0.5秒かかるが、メインスレッドは止まらない)
             feature = self.extract_feature_single(points_seq)
-            
             if feature is None:
                 return
 
-            # 結果の適用 (排他制御しながらデータを書き込む)
             with self.reid_lock:
                 feat_cpu = feature.cpu()
                 
                 if mode == "INIT":
                     self.registered_feature = feat_cpu
-                    # ギャラリーにも追加
                     target_cand.update_feature_gallery(feat_cpu)
                     self.feature_locked = True
                     self.state = "TRACKING"
                     self.get_logger().info(">>> [Async] Init Complete! Feature LOCKED.")
 
                 elif mode == "UPDATE":
-                    # メインスレッド側で「本人だ」と判断されている候補の特徴を更新
                     if self.target_candidate and self.target_candidate.id == target_cand.id:
-                        # 類似度チェック（念のため）
-                        # 現在の平均と比較
                         mean_feat, _ = target_cand.get_feature_distribution()
                         sim = 0.0
                         if len(target_cand.feature_gallery) < 10:
@@ -290,9 +362,8 @@ class PersonTrackerClickInitNode(Node):
                         elif mean_feat is not None:
                              sim = torch.dot(feature, mean_feat.to(self.device)).item()
                         
-                        if sim > 0.6: # 更新時は少し緩めに
+                        if sim > 0.6: 
                             target_cand.update_feature_gallery(feat_cpu)
-                            # Sim値も更新 (表示用)
                             target_cand.last_sim = sim
 
         except Exception as e:
@@ -327,7 +398,6 @@ class PersonTrackerClickInitNode(Node):
             self.get_logger().warn(">>> No candidate found near click position!")
 
     def bbox_callback(self, msg: Detection3DArray):
-        # メインループ: ここは絶対にブロックさせない！
         current_time = time.time()
         if hasattr(msg.header.stamp, 'sec'):
             raw_ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
@@ -353,7 +423,9 @@ class PersonTrackerClickInitNode(Node):
             except: continue
             if raw_points.shape[0] < 5: continue 
             
-            # --- PCAフィルタ (壁対策) ---
+            # =========================================================
+            # ★PCAフィルタ (壁・ポール対策)
+            # =========================================================
             points_xy = raw_points[:, :2]
             mean_xy = np.mean(points_xy, axis=0)
             centered_xy = points_xy - mean_xy
@@ -369,30 +441,47 @@ class PersonTrackerClickInitNode(Node):
             std_major = np.sqrt(lambda1) 
             std_minor = np.sqrt(lambda2) 
             
-            if std_major > 0.45: continue
+            # (A) 壁: 大きすぎる (幅 2.1m以上)
+            if std_major > 0.35: 
+                continue
+            
+            # (B) 壁: 細長すぎる (比率 5倍以上)
             ratio = std_major / std_minor
-            if ratio > 5.0: continue
-            # ---------------------------
+            if ratio > 5.0: 
+                continue
 
+            # (C) ★変更: ポール対策 (形状チェックのみ)
+            # サイズに関わらず、形状が「真円」に近すぎる(表面が滑らかすぎる)ものを弾く
+            
+            # 重心からの距離(半径)を計算
+            dists_from_center = np.linalg.norm(centered_xy, axis=1)
+            
+            # 半径の標準偏差 (凹凸具合)
+            std_radial = np.std(dists_from_center)
+            
+            # 人間は凹凸があるため 0.05 以上になることが多い
+            # 0.04未満ということは、非常に綺麗な円筒形（ポール）である可能性が高い
+            if std_radial < 0.04: 
+                continue
+                    
+            # =========================================================
+            
             norm_points = normalize_point_cloud(raw_points, num_points=256)
             bbox = detection.bbox
             pos = np.array([bbox.center.position.x, bbox.center.position.y, bbox.center.position.z])
             size = np.array([bbox.size.x, bbox.size.y, bbox.size.z])
             detections.append({'pos': pos, 'size': size, 'ori': bbox.center.orientation, 'points': norm_points})
 
-        # 1. 位置による追跡更新 (常に実行)
         self.update_candidates(detections, current_time)
 
-        # 2. 状態管理とReIDトリガー
         current_json_data = [0, 0, 0, 0, -1]
         
         if self.state == "INITIALIZING":
-            self.process_initialization_async() # 非同期版呼び出し
+            self.process_initialization_async() 
             if self.target_candidate:
                 current_json_data = self.get_2d_target_info(self.target_candidate)
                 
         elif self.state == "TRACKING" or self.state == "LOST":
-            # トラッキングロジック内で、必要に応じて非同期推論をキックする
             self.process_autonomous_tracking(raw_ts)
             if self.state == "TRACKING" and self.target_candidate:
                 current_json_data = self.get_2d_target_info(self.target_candidate)
@@ -437,15 +526,12 @@ class PersonTrackerClickInitNode(Node):
             if i not in matched_det_indices:
                 nid = self.next_candidate_id
                 self.next_candidate_id += 1
-                self.candidates[nid] = Candidate(nid, det['pos'], det['size'], det['ori'], det['points'])
+                # ★追加: ここでTRACKING_ALGOを渡す
+                self.candidates[nid] = Candidate(nid, det['pos'], det['size'], det['ori'], det['points'], algo=self.TRACKING_ALGO)
                 active_ids.add(nid)
         self.candidates = {k: v for k, v in self.candidates.items() if k in active_ids}
 
-    # =========================================================
-    # ★変更: 非同期初期化ロジック
-    # =========================================================
     def process_initialization_async(self):
-        # ターゲットが消えていないかチェック
         if not (self.target_candidate and self.target_candidate.id in self.candidates):
              self.pub_status.publish(String(data="Target Lost during Init"))
              return
@@ -455,14 +541,10 @@ class PersonTrackerClickInitNode(Node):
         
         status_msg = f"INITIALIZING: {self.captured_frames_count}/30"
         
-        # 30フレーム溜まったら、かつスレッドが空いていれば推論開始
         if self.captured_frames_count >= 30 and not self.is_reid_running:
             status_msg += " [Processing...]"
             self.is_reid_running = True
-            
-            # データのコピーを作成してスレッドに渡す (Queueの中身が変わるため)
             seq_copy = list(self.target_candidate.queue)
-            
             self.reid_thread = threading.Thread(
                 target=self.async_reid_worker,
                 args=(self.target_candidate, seq_copy, "INIT")
@@ -471,26 +553,16 @@ class PersonTrackerClickInitNode(Node):
             
         self.pub_status.publish(String(data=status_msg))
 
-    # =========================================================
-    # ★変更: 非同期トラッキングロジック
-    # =========================================================
     def process_autonomous_tracking(self, timestamp_nanosec):
-        # ここでは「位置合わせ(UKF)」は既に完了している前提。
-        # ReIDの更新やリカバリー判定を行う。
-        
         target_found = False
         
-        # 現在ターゲットを追跡中か？
         if self.target_candidate and self.target_candidate.id in self.candidates:
             self.target_candidate = self.candidates[self.target_candidate.id]
             target_found = True
             
-            # --- ReID更新 (非同期) ---
-            # 5フレームに1回、かつスレッドが空いていれば更新を試みる
             self.execution_count += 1
             if (self.execution_count % 5 == 0) and not self.is_reid_running:
                 
-                # 混雑判定
                 is_crowded = False
                 for cid, cand in self.candidates.items():
                     if cid == self.target_candidate.id: continue
@@ -508,18 +580,10 @@ class PersonTrackerClickInitNode(Node):
                     )
                     self.reid_thread.start()
 
-        # --- LOST時の処理 ---
         if not target_found:
             self.state = "LOST"
             self.pub_status.publish(String(data="LOST - Searching..."))
             
-            # LOST時のリカバリーは、重いのでメインスレッドでやると詰まる。
-            # ここでは簡易的に「位置が予測に近い候補」がいれば暫定復帰させる等の処理を入れるか、
-            # もしくはリカバリー自体も非同期にする設計が理想。
-            # 今回はシンプルにするため、メインスレッドで同期的に行う(ただし頻度を下げる)
-            
-            # リカバリー処理 (同期)
-            # ※本来はここも非同期にすべきだが、候補数が少なければ高速なので一旦そのまま
             best_sim = -1.0
             best_cand = None
             
@@ -532,13 +596,11 @@ class PersonTrackerClickInitNode(Node):
             target_gallery_len = len(self.target_candidate.feature_gallery) if self.target_candidate else 0
 
             for cid, cand in self.candidates.items():
-                if len(cand.queue) < 5: continue # 点群が少なすぎるのは無視
+                if len(cand.queue) < 5: continue 
                 
                 search_seq = list(cand.queue)
                 while len(search_seq) < 30: search_seq.append(search_seq[-1])
                 
-                # ここだけはGPU推論してしまう(やむなし)。
-                # ただしLOST中は頻繁に起きないので許容範囲か。
                 feat = self.extract_feature_single(search_seq[:30])
                 if feat is None: continue
                 feat = feat.cpu()
@@ -654,6 +716,10 @@ class PersonTrackerClickInitNode(Node):
                 label += "\nSim:Calc..."
             if is_target and not self.feature_locked: 
                 label += f"\nInit:{self.captured_frames_count}/30"
+            
+            # アルゴリズムの表示 (デバッグ用)
+            label += f"\n[{cand.algo}]"
+            
             text.text = label
             text.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
             marker_array.markers.append(text)
