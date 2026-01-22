@@ -52,7 +52,7 @@ class PubPillarBbox(Node):
             marker.color.r = 1.0
             marker.color.g = 0.0
             marker.color.b = 0.0
-            marker.color.a = 0.7  # 透明度
+            marker.color.a = 0.4  # 透明度
             
             # マーカーの表示時間を設定 (例: 1秒)
             marker.lifetime = Duration(seconds=1.0).to_msg()
