@@ -67,6 +67,10 @@ install(PROGRAMS
   scripts/reid3d.py
   scripts/tpt_reid3d.py
   scripts/tpt2_reid3d.py
+  scripts/dwa_controller.py
+  scripts/virtual_target.py
+  scripts/sfm_controller.py
+  scripts/mpc_controller.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -74,6 +78,7 @@ install(PROGRAMS
 install(DIRECTORY
   launch
   rviz
+  config
   DESTINATION share/${PROJECT_NAME}
 )
 
