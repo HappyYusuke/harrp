@@ -25,11 +25,11 @@ class PubPillarBbox(Node):
 
     def detection_callback(self, msg: Detection3DArray):
     	# 処理速度計測用
-    	start_time = time.perf_counter()
-    
+        start_time = time.perf_counter()
+    	
         marker_array = MarkerArray()
-        
-        # 検出された各オブジェクトに対してマーカーを作成
+    	
+    	# 検出された各オブジェクトに対してマーカーを作成
         for i, detection in enumerate(msg.detections):
             marker = Marker()
             marker.header = msg.header
