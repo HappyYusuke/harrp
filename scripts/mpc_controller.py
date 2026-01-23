@@ -70,14 +70,14 @@ class MPCController(Node):
         self.add_on_set_parameters_callback(self.parameter_callback)
 
         # Publishers / Subscribers
-        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.path_pub = self.create_publisher(Path, '/mpc/predict_path', 10)
-        self.obs_pub = self.create_publisher(Marker, '/mpc/obstacles', 10)
-        self.robot_radius_pub = self.create_publisher(Marker, '/mpc/robot_radius', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.path_pub = self.create_publisher(Path, 'mpc/predict_path', 10)
+        self.obs_pub = self.create_publisher(Marker, 'mpc/obstacles', 10)
+        self.robot_radius_pub = self.create_publisher(Marker, 'mpc/robot_radius', 10)
         
-        self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
+        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.create_subscription(PoseStamped, 'target_pose', self.target_callback, 10)
-        self.create_subscription(LaserScan, 'scan', self.scan_callback, 10)
+        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         
         self.state = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
         self.target = None

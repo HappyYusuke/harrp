@@ -64,9 +64,8 @@ install(TARGETS
 # Pythonスクリプト
 install(PROGRAMS
   scripts/pub_pillar_bbox.py
-  scripts/reid3d.py
+  scripts/reid3d_with_tracker.py
   scripts/tpt_reid3d.py
-  scripts/tpt2_reid3d.py
   scripts/dwa_controller.py
   scripts/virtual_target.py
   scripts/sfm_controller.py

@@ -8,10 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import math
-import json
-import cv2 
-import glob
-import bisect
 import threading
 
 # --- FilterPy Imports ---
@@ -256,30 +252,21 @@ class PersonTrackerClickInitNode(Node):
 
         self.USE_WEIGHTED_SCORE = True
 
-        self.gt_timestamps = []
-        gt_path = os.path.expanduser("~/tpt-bench/GTs/0035_dark.json") 
-        if os.path.exists(gt_path):
-            with open(gt_path, 'r') as f:
-                gt_data = json.load(f)
-                self.gt_timestamps = sorted([int(k) for k in gt_data.keys()])
-            self.get_logger().info(f">>> Loaded {len(self.gt_timestamps)} DARK frames from {gt_path}")
-        else:
-            self.get_logger().error(f"GT file not found: {gt_path}")
-
         qos_profile = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.sub_bbox = self.create_subscription(Detection3DArray, '/bbox', self.bbox_callback, qos_profile)
         self.sub_goal = self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
-        self.pub_markers = self.create_publisher(MarkerArray, '/person_reid_markers', 10)
-        self.pub_status = self.create_publisher(String, '/target_status', 10)
+        self.pub_markers = self.create_publisher(MarkerArray, 'reid3d/person_reid_markers', 10)
+        self.pub_status = self.create_publisher(String, 'tracker/target_status', 10)
+        self.pub_status_marker = self.create_publisher(Marker, 'tracker/status_3d', 10)
+        self.pub_target_pose = self.create_publisher(PoseStamped, 'tracker/target_pose', 10)
 
         self.state = "WAIT_FOR_CLICK"
         self.target_candidate = None    
         self.registered_feature = None 
-        self.feature_locked = False     
+        self.feature_locked = False      
         self.captured_frames_count = 0 
         self.candidates = {} 
         self.next_candidate_id = 0
-        self.json_results = {}
         
         self.reid_thread = None
         self.is_reid_running = False
@@ -388,21 +375,7 @@ class PersonTrackerClickInitNode(Node):
 
     def bbox_callback(self, msg: Detection3DArray):
         current_time = time.time()
-        if hasattr(msg.header.stamp, 'sec'):
-            raw_ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
-        else:
-            raw_ts = msg.header.stamp.nanoseconds
-
-        target_timestamp_str = None
-        if self.gt_timestamps:
-            idx = bisect.bisect_left(self.gt_timestamps, raw_ts)
-            candidates = []
-            if idx < len(self.gt_timestamps): candidates.append(self.gt_timestamps[idx])
-            if idx > 0: candidates.append(self.gt_timestamps[idx - 1])
-            if candidates:
-                nearest_ts = min(candidates, key=lambda x: abs(x - raw_ts))
-                if abs(nearest_ts - raw_ts) < 100000000:
-                    target_timestamp_str = str(nearest_ts)
+        # GT読み込みとタイムスタンプ処理を削除
 
         detections = []
         for detection in msg.detections:
@@ -454,29 +427,24 @@ class PersonTrackerClickInitNode(Node):
 
         self.update_candidates(detections, current_time)
 
-        current_json_data = [0, 0, 0, 0, -1]
-        
         if self.state == "INITIALIZING":
             self.process_initialization_async() 
-            if self.target_candidate:
-                current_json_data = self.get_2d_target_info(self.target_candidate)
                 
         elif self.state == "TRACKING" or self.state == "LOST":
-            self.process_autonomous_tracking(raw_ts)
+            self.process_autonomous_tracking()
+            
+            # ★追加: MPC連携用にターゲット位置をパブリッシュ
             if self.state == "TRACKING" and self.target_candidate:
-                current_json_data = self.get_2d_target_info(self.target_candidate)
-
-        if target_timestamp_str is not None:
-            target_id = self.target_candidate.id if self.target_candidate else 0
-            tracks_list = [[target_id] + current_json_data]
-            self.json_results[target_timestamp_str] = {
-                "target_info": current_json_data, 
-                "tracks_target_conf_bbox": tracks_list
-            }
-            if len(self.json_results) % 50 == 0:
-                self.save_results_to_json()
-
+                pose_msg = PoseStamped()
+                pose_msg.header = msg.header # 入力と同じフレームを使用（通常はodom）
+                pose_msg.pose.position.x = float(self.target_candidate.pos[0])
+                pose_msg.pose.position.y = float(self.target_candidate.pos[1])
+                pose_msg.pose.position.z = float(self.target_candidate.pos[2])
+                pose_msg.pose.orientation = self.target_candidate.orientation
+                self.pub_target_pose.publish(pose_msg)
+        
         self.publish_visualization(msg.header)
+        self.publish_status_marker_3d(msg.header)        
         
     def update_candidates(self, detections, current_time):
         matched_det_indices = set()
@@ -532,7 +500,7 @@ class PersonTrackerClickInitNode(Node):
             
         self.pub_status.publish(String(data=status_msg))
 
-    def process_autonomous_tracking(self, timestamp_nanosec):
+    def process_autonomous_tracking(self):
         target_found = False
         
         if self.target_candidate and self.target_candidate.id in self.candidates:
@@ -615,27 +583,37 @@ class PersonTrackerClickInitNode(Node):
         else:
             self.pub_status.publish(String(data=f"TRACKING ID:{self.target_candidate.id}"))
 
-    def get_2d_target_info(self, candidate):
-        pos_3d = candidate.pos
-        size_3d = candidate.size
-        confidence = candidate.last_sim if candidate.last_sim > 0 else 1.0
-        img_w = 1920
-        img_h = 960
-        x, y, z = pos_3d[0], pos_3d[1], pos_3d[2]
-        theta = math.atan2(y, x) 
-        dist_2d = math.sqrt(x**2 + y**2)
-        camera_height_offset = 0.4
-        phi = math.atan2(z - camera_height_offset, dist_2d)      
-        u = (0.5 - theta / (2 * math.pi)) * img_w
-        v = (0.5 - phi / math.pi) * img_h
-        dist_3d = math.sqrt(x**2 + y**2 + z**2)
-        if dist_3d < 0.1: dist_3d = 0.1
-        w_2d = (size_3d[1] / dist_3d) * (img_w / (2 * math.pi)) * 1.4
-        h_2d = (size_3d[2] / dist_3d) * (img_h / math.pi) * 1.4
-        u_tl = int(u - (w_2d / 2))
-        v_tl = int(v - (h_2d / 2))
-        u_tl = int(u_tl % img_w)
-        return [u_tl, v_tl, int(w_2d), int(h_2d), confidence]
+    def publish_status_marker_3d(self, header):
+        marker = Marker()
+        marker.header = header  # 入力点群(LiDAR/Camera)と同じフレームを使用
+        marker.ns = "status_3d"
+        marker.id = 0
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
+        
+        # センサーの1.5m上、少し前方に表示
+        marker.pose.position.x = 1.0 
+        marker.pose.position.y = 0.0
+        marker.pose.position.z = 1.5
+        marker.scale.z = 0.5  # 文字の大きさ
+
+        if self.state == "INITIALIZING":
+            marker.text = f"INITIALIZING ({self.captured_frames_count}/30)"
+            marker.color = ColorRGBA(r=0.3, g=0.3, b=1.0, a=1.0) # 青
+        elif self.state == "TRACKING":
+            tid = self.target_candidate.id if self.target_candidate else "?"
+            sim = self.target_candidate.last_sim if self.target_candidate else 0.0
+            marker.text = f"TRACKING ID:{tid}\nSim:{sim:.2f}"
+            marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0) # 緑
+        elif self.state == "LOST":
+            marker.text = "LOST - SEARCHING..."
+            marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0) # 赤
+        else:
+            marker.text = "WAITING FOR CLICK"
+            marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0) # 白
+
+        self.pub_status_marker.publish(marker)
 
     def publish_visualization(self, header):
         marker_array = MarkerArray()
@@ -675,7 +653,7 @@ class PersonTrackerClickInitNode(Node):
                 mk.color = ColorRGBA(r=0.7, g=0.7, b=0.7, a=0.3) 
             marker_array.markers.append(mk)
             
-            # ★追加: ターゲットのみパーティクル描画 (PFの場合)
+            # ターゲットのみパーティクル描画 (PFの場合)
             if cand.algo == 'PF' and is_target:
                 p_mk = Marker()
                 p_mk.header = header
@@ -724,16 +702,6 @@ class PersonTrackerClickInitNode(Node):
             marker_array.markers.append(text)
         self.pub_markers.publish(marker_array)
 
-    def save_results_to_json(self):
-        filename = 'evaluation_results.json'
-        self.get_logger().info(f"Saving JSON results to {filename} ...")
-        try:
-            with open(filename, 'w') as f:
-                json.dump(self.json_results, f, indent=4)
-            self.get_logger().info("Save Complete!")
-        except Exception as e:
-            self.get_logger().error(f"Failed to save JSON: {e}")
-
 def main(args=None):
     rclpy.init(args=args)
     node = PersonTrackerClickInitNode()
@@ -742,7 +710,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.save_results_to_json()
         node.destroy_node()
         rclpy.shutdown()
 
