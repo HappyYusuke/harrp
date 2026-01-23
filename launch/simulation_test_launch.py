@@ -10,7 +10,7 @@ def generate_launch_description():
     config_path = os.path.join(
         get_package_share_directory('harrp'), # 自分のパッケージ名
         'config', # ディレクトリ構成に合わせて調整
-        'dwa_params.yaml'
+        'mpc_params.yaml'
     )
 
     # 3. DWAコントローラ

@@ -1,0 +1,23 @@
+mpc_controller:
+  ros__parameters:
+    # --- 制約条件 ---
+    max_speed: 0.8
+    min_speed: 0.0
+    max_yaw_rate: 1.2
+    max_accel: 0.5
+    max_dyaw_rate: 2.0
+    
+    # --- MPCパラメータ ---
+    dt: 0.2           # 予測の刻み時間 (s)
+    horizon: 8        # 何ステップ先まで読むか (8 * 0.2 = 1.6秒)
+    
+    # --- 重み付け (Cost Function) ---
+    w_dist: 1.0       # ゴールへ近づく重み
+    w_heading: 0.5    # ゴールを向く重み
+    w_vel: 1.5        # 速度を出す重み
+    w_obs: 0.8        # 障害物を避ける重み
+    
+    # --- 安全・センサ設定 ---
+    robot_radius: 0.3 # 安全マージン (m)
+    goal_tolerance: 0.5
+    sensor_offset: 0.0
