@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import LaserScan
-from visualization_msgs.msg import Marker, MarkerArray
+# 変更点1: PointCloud2 と読み込み用ライブラリをインポート
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
+from visualization_msgs.msg import Marker
+
 import numpy as np
 import math
 from scipy.optimize import minimize
-
-
 
 class MPCConfig:
     def __init__(self):
@@ -35,8 +37,11 @@ class MPCConfig:
         self.robot_radius = 0.3 # 安全マージン
         self.goal_tolerance = 0.5
         self.sensor_offset = 0.0 # Lidar位置補正
-
-
+        
+        # --- Livox用フィルタ設定 (追加) ---
+        self.min_height = -0.5  # これより低い点は無視（床対策）
+        self.max_height = 0.5   # これより高い点は無視
+        self.min_dist = 0.2     # 近すぎるノイズ除去
 
 class MPCController(Node):
     def __init__(self):
@@ -63,34 +68,35 @@ class MPCController(Node):
                 ('sensor_offset', self.config.sensor_offset),
             ]
         )
-        # 初期値をパラメータサーバから取得して反映
         self.update_config_from_params()
-        
-        # パラメータ変更時のコールバック登録
         self.add_on_set_parameters_callback(self.parameter_callback)
 
-        # Publishers / Subscribers
+        # Publishers
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_pub = self.create_publisher(Path, 'mpc/predict_path', 10)
         self.obs_pub = self.create_publisher(Marker, 'mpc/obstacles', 10)
         self.robot_radius_pub = self.create_publisher(Marker, 'mpc/robot_radius', 10)
         
-        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        # QoS
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        # Subscribers
+        self.create_subscription(Odometry, '/odom', self.odom_callback, qos_profile)
         self.create_subscription(PoseStamped, 'target_pose', self.target_callback, 10)
-        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_callback, 10)
         
         self.state = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
         self.target = None
         self.obstacles = []
-        self.is_reached = False
-        
-        # ウォームスタート用配列初期化
         self.prev_solution = np.zeros(self.config.horizon * 2)
         
         self.timer = self.create_timer(0.1, self.control_loop)
 
     def update_config_from_params(self):
-        """起動時に全パラメータを読み込む"""
         self.config.max_speed = self.get_parameter('max_speed').value
         self.config.min_speed = self.get_parameter('min_speed').value
         self.config.max_yaw_rate = self.get_parameter('max_yaw_rate').value
@@ -107,23 +113,16 @@ class MPCController(Node):
         self.config.sensor_offset = self.get_parameter('sensor_offset').value
 
     def parameter_callback(self, params):
-        """実行中にパラメータが変更された時の処理"""
         horizon_changed = False
-        
         for param in params:
             if hasattr(self.config, param.name):
-                # 設定値を更新
                 setattr(self.config, param.name, param.value)
-                
-                # horizonが変わった場合はフラグを立てる
                 if param.name == 'horizon':
                     horizon_changed = True
-                    
                 self.get_logger().info(f'Parameter updated: {param.name} = {param.value}')
 
-        # horizonが変わった場合、最適化用の配列サイズが変わるためリセットする
         if horizon_changed:
-            self.get_logger().warn(f'Horizon changed to {self.config.horizon}. Resetting optimization buffer.')
+            self.get_logger().warn(f'Horizon changed. Resetting buffer.')
             self.prev_solution = np.zeros(self.config.horizon * 2)
 
         return SetParametersResult(successful=True)
@@ -139,34 +138,63 @@ class MPCController(Node):
     def target_callback(self, msg):
         self.target = np.array([msg.pose.position.x, msg.pose.position.y])
 
-    def scan_callback(self, msg):
+    # 変更点3: Livox用の新しいコールバック関数
+    def lidar_callback(self, msg):
         obs = []
-        ignore_radius = 0.1
-        step = 3 
         
-        for i, r in enumerate(msg.ranges):
-            if i % step != 0: continue
+        # オドメトリから現在のロボット姿勢を取得
+        rx, ry, ryaw = self.state[0], self.state[1], self.state[2]
+        c_yaw = math.cos(ryaw)
+        s_yaw = math.sin(ryaw)
+
+        # 点群データの読み込み (x, y, z のジェネレータ)
+        # skip_n: データが多すぎる場合、間引く数を増やす (例: 5点に1点採用)
+        skip_n = 5
+        point_generator = point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+        
+        for i, point in enumerate(point_generator):
+            if i % skip_n != 0: continue
+
+            x, y, z = point
+
+            # フィルタリング 1: 高さ (Z軸)
+            # ロボットの高さに合わせて調整してください。床を含めないように注意。
+            if z < self.config.min_height or z > self.config.max_height:
+                continue
             
-            if not math.isinf(r) and not math.isnan(r):
-                if ignore_radius < r < msg.range_max:
-                    # インデックスから正確な角度を計算
-                    current_angle = msg.angle_min + i * msg.angle_increment
-                    # 反転補正
-                    fixed_angle = -current_angle 
-                    
-                    ox = r * math.cos(fixed_angle + self.state[2]) + self.state[0]
-                    oy = r * math.sin(fixed_angle + self.state[2]) + self.state[1]
-                    obs.append([ox, oy])
-                    
-        self.obstacles = np.array(obs)
+            # フィルタリング 2: 距離 (近すぎるノイズを除去)
+            dist = math.hypot(x, y)
+            if dist < self.config.min_dist:
+                continue
+
+            # 座標変換: ロボット座標系(Lidar) -> ワールド座標系(Odom)
+            # ※ Lidarがロボットの中心(またはsensor_offset分前方)にあると仮定
+            # 回転
+            gx = x * c_yaw - y * s_yaw
+            gy = x * s_yaw + y * c_yaw
+            
+            # 並進 (sensor_offset を考慮)
+            # オフセット分だけ、現在の向きに座標をずらす
+            offset_x = self.config.sensor_offset * c_yaw
+            offset_y = self.config.sensor_offset * s_yaw
+
+            ox = gx + rx + offset_x
+            oy = gy + ry + offset_y
+
+            obs.append([ox, oy])
+        
+        if len(obs) > 0:
+            self.obstacles = np.array(obs)
+        else:
+            self.obstacles = np.array([])
 
     def predict_next_state(self, state, v, w, dt):
         x, y, yaw, _, _ = state
         x += v * math.cos(yaw) * dt
         y += v * math.sin(yaw) * dt
         yaw += w * dt
-        while yaw > math.pi: yaw -= 2*math.pi
-        while yaw < -math.pi: yaw += 2*math.pi
+        # 角度正規化
+        yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
         return np.array([x, y, yaw, v, w])
 
     def cost_function(self, u_flat):
@@ -186,15 +214,26 @@ class MPCController(Node):
             
             target_yaw = math.atan2(dy, dx)
             yaw_diff = abs(target_yaw - pyaw)
-            while yaw_diff > math.pi: yaw_diff -= 2*math.pi
+            yaw_diff = (yaw_diff + math.pi) % (2 * math.pi) - math.pi # 正規化
             cost += self.config.w_heading * abs(yaw_diff)
             
             target_v = self.config.max_speed if dist > 1.0 else 0.0
             cost += self.config.w_vel * abs(target_v - v)
             
+            # 障害物回避コスト (障害物がある場合のみ計算)
             if len(self.obstacles) > 0:
-                obs_dists = np.hypot(self.obstacles[:,0] - px, self.obstacles[:,1] - py)
+                # すべての障害物との距離を計算するのは重いので、
+                # ここでは単純化のために直近のデータを使うか、または
+                # scipy.spatial.KDTreeなどを使うのが望ましいが、元のロジックを踏襲する
+                
+                # 計算量削減のため、予測位置周辺の障害物だけを考慮するのが一般的だが
+                # ここではNumPyのブロードキャストで一括計算
+                dx_obs = self.obstacles[:, 0] - px
+                dy_obs = self.obstacles[:, 1] - py
+                obs_dists = np.hypot(dx_obs, dy_obs)
+                
                 min_obs_dist = np.min(obs_dists)
+                
                 if min_obs_dist < self.config.robot_radius:
                     cost += self.config.w_obs * (1.0 / (min_obs_dist + 0.01)) * 100
                 elif min_obs_dist < self.config.robot_radius + 0.5:
@@ -209,6 +248,7 @@ class MPCController(Node):
         dx = self.target[0] - self.state[0]
         dy = self.target[1] - self.state[1]
         if math.hypot(dx, dy) < self.config.goal_tolerance:
+            self.get_logger().info("Goal Reached")
             return 0.0, 0.0, []
 
         bounds = []
@@ -259,12 +299,16 @@ class MPCController(Node):
         marker.id = 0
         marker.type = Marker.POINTS
         marker.action = Marker.ADD
-        marker.scale.x = 0.1
-        marker.scale.y = 0.1
+        marker.scale.x = 0.05 # サイズ調整
+        marker.scale.y = 0.05
         marker.color.r = 1.0; marker.color.a = 1.0
-        for obs in self.obstacles:
-            p = Point(); p.x = obs[0]; p.y = obs[1]
-            marker.points.append(p)
+        
+        # 表示する障害物点群を間引く（描画負荷軽減）
+        display_step = 5
+        for i, obs in enumerate(self.obstacles):
+            if i % display_step == 0:
+                p = Point(); p.x = obs[0]; p.y = obs[1]
+                marker.points.append(p)
         self.obs_pub.publish(marker)
         
     def publish_robot_radius(self):
@@ -275,25 +319,18 @@ class MPCController(Node):
         marker.id = 0
         marker.type = Marker.CYLINDER
         marker.action = Marker.ADD
-        
-        # ロボットの現在位置
         marker.pose.position.x = self.state[0]
         marker.pose.position.y = self.state[1]
-        marker.pose.position.z = 0.0 # 床の高さ
+        marker.pose.position.z = 0.0
         marker.pose.orientation.w = 1.0
-        
-        # サイズ設定 (Scaleは直径を指定する)
         diameter = self.config.robot_radius * 2.0
         marker.scale.x = diameter
         marker.scale.y = diameter
-        marker.scale.z = 0.05  # 厚み（薄い円盤にする）
-        
-        # 色設定 (シアン色、半透明)
+        marker.scale.z = 0.05
         marker.color.r = 0.0
         marker.color.g = 1.0
         marker.color.b = 1.0
-        marker.color.a = 0.3   # 透明度 (0.0~1.0)
-        
+        marker.color.a = 0.3
         self.robot_radius_pub.publish(marker)
 
     def control_loop(self):
@@ -305,8 +342,6 @@ class MPCController(Node):
         self.publish_path(path)
         self.publish_obstacles()
         self.publish_robot_radius()
-
-
 
 def main(args=None):
     rclpy.init(args=args)

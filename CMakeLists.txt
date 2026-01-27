@@ -70,6 +70,7 @@ install(PROGRAMS
   scripts/virtual_target.py
   scripts/sfm_controller.py
   scripts/mpc_controller.py
+  scripts/odom_tf_broadcaster.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

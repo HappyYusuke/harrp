@@ -21,7 +21,25 @@ def generate_launch_description():
 
     namespace = 'harrp'
 
+    # 購読するオドメトリのトピック名
+    odom_topic_name = '/kachaka/odometry/odometry'
+
     return LaunchDescription([
+        Node(
+            package='harrp',
+            executable='odom_tf_broadcaster.py',
+            name='odom_tf_broadcaster',
+            output='screen',
+            parameters=[
+                {'parent_frame': 'odom'},
+                {'child_frame': 'livox_frame'},
+            ],
+            remappings=[
+                # オドメトリ購読用トピック
+                ('/odom', odom_topic_name),
+            ],
+        ),
+
         Node(
             package='harrp',
             executable='mpc_controller.py',
@@ -29,6 +47,14 @@ def generate_launch_description():
             namespace=namespace,
             output='screen',
             parameters=[mpc_config],
+            remappings=[
+                # ロボット制御用トピック
+                ('/cmd_vel', '/cmd_vel'),
+                # オドメトリ購読用トピック
+                ('/odom', odom_topic_name),
+                # 3D LiDAR購読用トピック
+                ('/livox/lidar', '/livox/lidar'),
+            ],
         ),
 
         Node(

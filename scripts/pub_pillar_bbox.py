@@ -65,7 +65,7 @@ class PubPillarBbox(Node):
         # 処理速度計測用
         end_time = time.perf_counter()
         elapsed_ms = (end_time - start_time) * 1000
-        self.get_logger().info(f'Processing time: {elapsed_ms:.3f} ms')
+        #self.get_logger().info(f'Processing time: {elapsed_ms:.3f} ms')
 
 
 def main(args=None):
