@@ -40,7 +40,7 @@ class PubPillarBbox(Node):
             
             # バウンディングボックスのz軸を下げる(TAO PointPillarsとROS2のギャップ)
             detection.bbox.center.position.z \
-                    = detection.bbox.center.position.z + (detection.bbox.size.z/2)
+                    = detection.bbox.center.position.z #+ (detection.bbox.size.z/2)
 
             # バウンディングボックスの中心位置と姿勢を設定
             marker.pose = detection.bbox.center

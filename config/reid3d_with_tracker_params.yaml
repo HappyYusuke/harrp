@@ -1,0 +1,33 @@
+harrp:
+  person_tracker_click_init:
+    ros__parameters:
+      tracking:
+        algo: "PF"                # "PF" (Particle Filter) or "UKF" (Unscented Kalman Filter)
+        max_missing_time: 0.01     # 追跡対象が見えなくなってからロストとみなすまでの時間(s)
+        match_dist_thresh: 1.0    # フレーム間の同一人物判定の距離閾値(m)
+        pf_num_particles: 100     # パーティクルフィルタの粒子数
+        pf_process_noise_pos: 0.05
+        pf_process_noise_vel: 0.1
+        pf_measurement_noise_std: 0.2
+  
+      reid:
+        sim_thresh: 0.80          # ReIDの類似度閾値 (0.0 ~ 1.0)
+        sequence_length: 30       # 特徴量抽出に使うフレーム数
+        gallery_size: 20         # 過去の特徴量を保存する数
+        feature_dim: 1024         # ネットワークの特徴量次元
+        num_class: 222            # ネットワークのクラス数
+  
+      detection:
+        pca_wall_thresh: 0.35     # 壁とみなす固有値の大きさ
+        pca_ratio_thresh: 5.0     # 細長比率
+        pca_radial_thresh: 0.04   # 放射分散 (ポール除去など)
+        min_points: 5             # クラスタの最小点数
+        normalize_num_points: 256 # ネットワークに入力する点群数
+        robot_radius: 0.3         # ロボットの範囲
+  
+      target_selection:
+        mode: 0                   # 0: Auto Front Selection, 1: Manual Click in Rviz
+        auto_x_min: 0.0           # 自動選択の範囲 (前方X最小)
+        auto_x_max: 1.2           # 自動選択の範囲 (前方X最大)
+        auto_y_min: -0.5          # 自動選択の範囲 (左右Y最小)
+        auto_y_max: 0.5           # 自動選択の範囲 (左右Y最大)

@@ -1,23 +1,29 @@
-mpc_controller:
-  ros__parameters:
-    # --- 制約条件 ---
-    max_speed: 0.8
-    min_speed: 0.0
-    max_yaw_rate: 1.2
-    max_accel: 0.5
-    max_dyaw_rate: 2.0
-    
-    # --- MPCパラメータ ---
-    dt: 0.2           # 予測の刻み時間 (s)
-    horizon: 8        # 何ステップ先まで読むか (8 * 0.2 = 1.6秒)
-    
-    # --- 重み付け (Cost Function) ---
-    w_dist: 1.0       # ゴールへ近づく重み
-    w_heading: 0.5    # ゴールを向く重み
-    w_vel: 1.5        # 速度を出す重み
-    w_obs: 0.8        # 障害物を避ける重み
-    
-    # --- 安全・センサ設定 ---
-    robot_radius: 0.3 # 安全マージン (m)
-    goal_tolerance: 0.5
-    sensor_offset: 0.0
+harrp:
+  mpc_controller:
+    ros__parameters:
+      # --- 制約条件 ---
+      max_speed: 0.3        # 最高並進速度 [m/s]
+      min_speed: 0.0        # 最低並進速度 [m/s] (後退なし)
+      max_yaw_rate: 0.5     # 最高旋回速度 [rad/s]
+      max_accel: 0.5        # 最大加速度 [m/s^2]
+      max_dyaw_rate: 1.0    # 最大角加速度 [rad/s^2]
+  
+      # --- MPCパラメータ ---
+      dt: 0.1               # 予測の刻み時間 [s]
+      horizon: 15            # 予測ホライズン (何ステップ先まで読むか)
+  
+      # --- 重み付け (Cost Function) ---
+      w_dist: 0.1           # ゴールへの距離の重み
+      w_heading: 0.1        # ゴール方向への向きの重み
+      w_vel: 0.1            # 目標速度維持の重み
+      w_obs: 0.0            # 障害物回避の重み
+  
+      # --- ロボット設定 ---
+      robot_radius: 0.3     # ロボットの半径 (衝突判定用) [m]
+      goal_tolerance: 0.8   # ゴールとみなす距離 [m] (この距離内で旋回モードへ移行)
+      sensor_offset: 0.156    # ロボット中心から見たLiDARの前後位置補正 [m]
+  
+      # --- 停止時旋回制御 (PD制御) ---
+      turn_kp: 0.5          # 比例ゲイン (P): 目標角度へ向かう強さ
+      turn_kd: 0.2          # 微分ゲイン (D): 急激な動きを抑えるダンピング効果
+      turn_yaw_tolerance: 0.1 # 許容角度誤差 [rad] (これ以下なら回転停止)
