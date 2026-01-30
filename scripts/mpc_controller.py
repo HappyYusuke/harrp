@@ -548,7 +548,6 @@ class MPCController(Node):
         msg = Twist()
         msg.linear.x = float(v)
         msg.angular.z = float(w)
-        # ★コメントアウト解除: 実際にロボットを動かす
         self.cmd_vel_pub.publish(msg)
         self.publish_path(path)
         self.publish_obstacles()

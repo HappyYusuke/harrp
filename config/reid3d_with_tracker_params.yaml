@@ -6,9 +6,10 @@ harrp:
         max_missing_time: 1.0          # 追跡対象が見えなくなってからロストとみなすまでの時間 [s]
         match_dist_thresh: 1.0         # フレーム間の同一人物判定の距離閾値 [m]
         pf_num_particles: 500          # パーティクルフィルタの粒子数
-        pf_process_noise_pos: 0.05      # 位置のプロセスノイズ (初期粒子の拡散具合) [m]
-        pf_process_noise_vel: 0.35      # 速度のプロセスノイズ (粒子の散らばり速度) [m/s]
-        pf_measurement_noise_std: 0.3  # 観測ノイズの標準偏差 (観測値と粒子の位置から尤度計算する) [m]
+        pf_process_noise_pos: 0.05     # 位置のプロセスノイズ (初期粒子の拡散具合) [m]
+        pf_process_noise_vel: 0.35     # 速度のプロセスノイズ (粒子の散らばり速度) [m/s]
+        pf_std_long: 0.15              # 進行方向の分散
+        pf_std_lat: 0.15               # 横方向の分散
   
       reid:
         sim_thresh: 0.80          # ReIDの類似度閾値 (0.0 ~ 1.0)

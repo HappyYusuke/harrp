@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import math
 import threading
-import struct
+import struct # PointCloud2の色変換用
 
 # --- Parallel Processing Imports ---
 from concurrent.futures import ProcessPoolExecutor
@@ -63,10 +63,6 @@ def normalize_point_cloud(points, num_points=256):
 # 並列処理用のワーカー関数 (クラス外に定義)
 # ==========================================
 def preprocess_detection_worker(args):
-    """
-    1つのDetection3Dメッセージを受け取り、前処理（PCA, フィルタ, 正規化）を行った結果を返す。
-    Pickle化できるようにトップレベル関数として定義。
-    """
     detection, params = args
 
     if detection.source_cloud.width * detection.source_cloud.height == 0:
@@ -111,12 +107,10 @@ def preprocess_detection_worker(args):
     pos = np.array([bbox.center.position.x, bbox.center.position.y, bbox.center.position.z])
     size = np.array([bbox.size.x, bbox.size.y, bbox.size.z])
     
-    # ロボットの半径内にある検出は無視する
     dist_xy = np.hypot(pos[0], pos[1])
     if dist_xy < params['robot_radius']:
         return None
 
-    # 結果を辞書で返す
     return {
         'pos': pos,
         'size': size,
@@ -125,17 +119,24 @@ def preprocess_detection_worker(args):
     }
 
 # ==========================================
-# 1. Particle Filter Implementation
+# 1. Particle Filter Implementation (With Mahalanobis & ReID Likelihood)
+# ==========================================
+# ==========================================
+# 1. Particle Filter Implementation (Fix: Add missing estimate method)
 # ==========================================
 class ParticleFilterTracker(object):
     def __init__(self, initial_pos, params):
         self.num_particles = params['pf_num_particles']
         self.particles = np.zeros((self.num_particles, 6))
         
+        # 初期化: Z方向のばらつきは小さめに
         self.particles[:, 0] = initial_pos[0] + np.random.randn(self.num_particles) * 0.1
         self.particles[:, 1] = initial_pos[1] + np.random.randn(self.num_particles) * 0.1
-        self.particles[:, 2] = initial_pos[2] + np.random.randn(self.num_particles) * 0.05
-        self.particles[:, 3:6] = np.random.randn(self.num_particles, 3) * 0.1
+        self.particles[:, 2] = initial_pos[2] + np.random.randn(self.num_particles) * 0.02 
+        
+        # 速度初期値: Z速度はほぼ0にする
+        self.particles[:, 3:5] = np.random.randn(self.num_particles, 2) * 0.1
+        self.particles[:, 5]   = np.random.randn(self.num_particles) * 0.01 
         
         self.weights = np.ones(self.num_particles) / self.num_particles
         self.last_timestamp = None
@@ -144,7 +145,12 @@ class ParticleFilterTracker(object):
         
         self.process_noise_pos = params['pf_process_noise_pos']
         self.process_noise_vel = params['pf_process_noise_vel']
-        self.measurement_noise_std = params['pf_measurement_noise_std']
+        
+        # --- マハラノビス距離用パラメータ ---
+        self.std_long = params['pf_std_long'] 
+        self.std_lat = params['pf_std_lat']
+        # Z方向(高さ)の許容誤差
+        self.std_z = 0.1 
 
     def predict(self, current_time):
         if self.last_timestamp is None:
@@ -153,24 +159,60 @@ class ParticleFilterTracker(object):
             dt = current_time - self.last_timestamp
         self.last_timestamp = current_time
         
+        # 位置更新
         self.particles[:, 0] += self.particles[:, 3] * dt
         self.particles[:, 1] += self.particles[:, 4] * dt
         self.particles[:, 2] += self.particles[:, 5] * dt
         
-        self.particles[:, :3] += np.random.randn(self.num_particles, 3) * self.process_noise_pos
-        self.particles[:, 3:] += np.random.randn(self.num_particles, 3) * self.process_noise_vel
+        # --- プロセスノイズの適用 (Z方向を抑制) ---
+        # XYには設定通りのノイズ
+        self.particles[:, :2] += np.random.randn(self.num_particles, 2) * self.process_noise_pos
+        # Zには非常に小さいノイズのみ与える
+        self.particles[:, 2]  += np.random.randn(self.num_particles) * (self.process_noise_pos * 0.1)
+
+        # 速度更新 (XYのみ)
+        self.particles[:, 3:5] += np.random.randn(self.num_particles, 2) * self.process_noise_vel
+        # Z速度は減衰させる
+        self.particles[:, 5] *= 0.5 
         
         self.estimate()
         return self.x[:3]
 
-    def update(self, measurement):
-        dists = np.linalg.norm(self.particles[:, :3] - measurement, axis=1)
-        likelihood = np.exp(-0.5 * (dists / self.measurement_noise_std) ** 2)
+    def update(self, measurement, reid_sim=1.0, target_yaw=0.0):
+        """
+        マハラノビス距離(XY) + 単純ガウス(Z) + ReID尤度
+        """
+        # --- 1. XY平面のマハラノビス距離計算 ---
+        cov_local = np.diag([self.std_long**2, self.std_lat**2])
         
-        if np.sum(likelihood) == 0:
-            likelihood[:] = 1.0 / self.num_particles
+        c, s = np.cos(target_yaw), np.sin(target_yaw)
+        rot_mat = np.array([[c, -s], 
+                            [s,  c]])
+        
+        cov_global = rot_mat @ cov_local @ rot_mat.T
+        
+        try:
+            cov_inv = np.linalg.inv(cov_global)
+        except np.linalg.LinAlgError:
+            cov_inv = np.eye(2)
             
-        self.weights *= likelihood
+        diff_xy = self.particles[:, :2] - measurement[:2]
+        
+        # XYのマハラノビス距離^2
+        mahalanobis_sq_xy = np.einsum('ij,jk,ik->i', diff_xy, cov_inv, diff_xy)
+        
+        # --- 2. Z方向(高さ)の距離計算 ---
+        diff_z = self.particles[:, 2] - measurement[2]
+        z_sq = (diff_z / self.std_z) ** 2
+        
+        # --- 3. 空間尤度の統合 ---
+        spatial_likelihood = np.exp(-0.5 * (mahalanobis_sq_xy + z_sq))
+
+        # --- 4. 混合モデルによるReID統合 ---
+        uniform_weight = 1.0 / (self.num_particles * 100.0)
+        total_likelihood = (reid_sim * spatial_likelihood) + ((1.0 - reid_sim) * uniform_weight)
+        
+        self.weights *= total_likelihood
         self.weights += 1.e-300
         self.weights /= np.sum(self.weights)
         
@@ -178,6 +220,7 @@ class ParticleFilterTracker(object):
         self.resample()
 
     def estimate(self):
+        """ 重み付き平均で現在の状態(x)を推定する """
         self.x = np.average(self.particles, weights=self.weights, axis=0)
 
     def resample(self):
@@ -200,9 +243,9 @@ class ParticleFilterTracker(object):
             else:
                 j += 1
         return indexes
-
+        
 # ==========================================
-# 2. Unscented Kalman Filter Implementation
+# 2. Unscented Kalman Filter (Dummy Implementation for compatibility)
 # ==========================================
 def fx(x, dt):
     F = np.eye(6, dtype=float)
@@ -218,17 +261,14 @@ class KalmanBoxTracker(object):
     def __init__(self, initial_pos):
         points = MerweScaledSigmaPoints(n=6, alpha=0.1, beta=2.0, kappa=-3) 
         self.kf = UKF(dim_x=6, dim_z=3, dt=0.1, fx=fx, hx=hx, points=points)
-        
         self.kf.x[:3] = initial_pos
         self.kf.x[3:] = 0
         self.kf.P *= 1.0 
         self.kf.P[3:, 3:] *= 10.0
-        
         sensor_noise_std = 0.5  
         self.kf.R = np.diag([sensor_noise_std, sensor_noise_std, sensor_noise_std]) ** 2 
         self.kf.Q = np.eye(6) * 0.05**2
         self.kf.Q[3:, 3:] *= 2.0 
-        
         self.last_timestamp = None
 
     def predict(self, current_time):
@@ -237,11 +277,11 @@ class KalmanBoxTracker(object):
         else:
             dt = current_time - self.last_timestamp
         self.last_timestamp = current_time
-        
         self.kf.predict(dt=dt)
         return self.kf.x[:3]
 
-    def update(self, measurement):
+    def update(self, measurement, reid_sim=1.0, target_yaw=0.0):
+        # UKFは簡易実装のため、ReID/Yawは無視
         self.kf.update(measurement)
 
 # ==========================================
@@ -270,8 +310,16 @@ class Candidate:
         self.pred_pos = self.kf.predict(current_time)
         return self.pred_pos
 
-    def update_state(self, pos, size, orientation):
-        self.kf.update(pos)
+    def update_state(self, pos, size, orientation, sim=1.0):
+        # QuaternionからYaw角を計算
+        q = orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+        # 拡張されたupdateメソッドを呼び出し
+        self.kf.update(pos, reid_sim=sim, target_yaw=yaw)
+        
         if self.algo == "PF":
             self.pos = self.kf.x[:3]
         else:
@@ -311,7 +359,9 @@ class PersonTrackerClickInitNode(Node):
                 ('tracking.pf_num_particles', 500),
                 ('tracking.pf_process_noise_pos', 0.05),
                 ('tracking.pf_process_noise_vel', 0.1),
-                ('tracking.pf_measurement_noise_std', 0.2),
+                # ↓ 新しいパラメータ (マハラノビス距離用)
+                ('tracking.pf_std_long', 0.6), # 進行方向の分散 (大きめ)
+                ('tracking.pf_std_lat', 0.2),  # 横方向の分散 (小さめ)
 
                 ('reid.weight_path', f'{HOME_DIR}/ReID3D/reidnet/log/ckpt_best.pth'),
                 ('reid.sim_thresh', 0.80),
@@ -319,8 +369,6 @@ class PersonTrackerClickInitNode(Node):
                 ('reid.gallery_size', 100),
                 ('reid.feature_dim', 1024),
                 ('reid.num_class', 222),
-                
-                # ★追加: 本人確認用の閾値
                 ('reid.verify_thresh', 0.4),
 
                 ('detection.pca_wall_thresh', 0.35),
@@ -346,7 +394,9 @@ class PersonTrackerClickInitNode(Node):
             'pf_num_particles': self.get_parameter('tracking.pf_num_particles').value,
             'pf_process_noise_pos': self.get_parameter('tracking.pf_process_noise_pos').value,
             'pf_process_noise_vel': self.get_parameter('tracking.pf_process_noise_vel').value,
-            'pf_measurement_noise_std': self.get_parameter('tracking.pf_measurement_noise_std').value,
+            # ↓ 新しいパラメータ
+            'pf_std_long': self.get_parameter('tracking.pf_std_long').value,
+            'pf_std_lat': self.get_parameter('tracking.pf_std_lat').value,
             
             'reid_weight_path': self.get_parameter('reid.weight_path').value,
             'reid_sim_thresh': self.get_parameter('reid.sim_thresh').value,
@@ -354,8 +404,6 @@ class PersonTrackerClickInitNode(Node):
             'gallery_size': self.get_parameter('reid.gallery_size').value,
             'reid_feature_dim': self.get_parameter('reid.feature_dim').value,
             'reid_num_class': self.get_parameter('reid.num_class').value,
-            
-            # ★追加: 辞書への保存
             'verify_thresh': self.get_parameter('reid.verify_thresh').value,
 
             'pca_wall_thresh': self.get_parameter('detection.pca_wall_thresh').value,
@@ -372,14 +420,11 @@ class PersonTrackerClickInitNode(Node):
             'auto_y_max': self.get_parameter('target_selection.auto_y_max').value,
         }
         
-        self.get_logger().info(f"Tracking Algorithm: {self.params['tracking_algo']}")
-        self.get_logger().info(f"Robot Radius Filter: {self.params['robot_radius']} m")
+        self.get_logger().info(f"Tracking Algo: {self.params['tracking_algo']}")
+        self.get_logger().info(f"PF Std Long: {self.params['pf_std_long']}, Lat: {self.params['pf_std_lat']}")
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # PyTorchのCPUスレッド数を制限 (プロセスプールとの競合回避)
         torch.set_num_threads(4)
-        
         self.net = self._load_model()
         self.get_logger().info(f'Model Loaded on {self.device}')
 
@@ -406,7 +451,6 @@ class PersonTrackerClickInitNode(Node):
         self.is_reid_running = False
         self.reid_lock = threading.Lock()
 
-        # プロセスプールExecutorの初期化 (前処理の並列化用)
         self.process_executor = ProcessPoolExecutor(max_workers=4)
 
         if self.params['choose_target_from_rviz2'] == 1:
@@ -417,7 +461,6 @@ class PersonTrackerClickInitNode(Node):
         self.execution_count = 0
 
     def destroy_node(self):
-        # 終了時にExecutorをシャットダウン
         self.process_executor.shutdown()
         super().destroy_node()
 
@@ -496,16 +539,10 @@ class PersonTrackerClickInitNode(Node):
                         
                         target_cand.last_sim = sim
 
-                        # ★修正: パラメータから閾値を取得
                         verify_thresh = self.params['verify_thresh']
 
-                        # ★追加: 本人確認ロジック
                         if sim < verify_thresh:
                             self.get_logger().warn(f"Low Similarity Detected! Sim: {sim:.2f} < {verify_thresh}")
-                            # --- 以下のコメントアウトを外すと、IDスイッチ時に即LOST状態になります ---
-                            # self.state = "LOST"
-                            # self.target_candidate = None # ターゲットを破棄
-                            # return
 
                         if sim > 0.6: 
                             target_cand.update_feature_gallery(feat_cpu)
@@ -548,14 +585,10 @@ class PersonTrackerClickInitNode(Node):
 
         detections = []
         
-        # 並列処理用に引数リストを作成
         process_args = [(det, self.params) for det in msg.detections]
         
-        # Executorを使って並列実行
         if process_args:
             results = self.process_executor.map(preprocess_detection_worker, process_args)
-            
-            # 結果を回収
             for res in results:
                 if res is not None:
                     detections.append(res)
@@ -635,7 +668,12 @@ class PersonTrackerClickInitNode(Node):
                     best_idx = i
             if best_idx != -1:
                 det = detections[best_idx]
-                cand.update_state(det['pos'], det['size'], det['ori'])
+                
+                # --- ここでReIDスコアも更新に使用する ---
+                # last_sim が 0 (初期状態) の場合は 1.0 (信頼) と仮定
+                current_sim = cand.last_sim if cand.last_sim > 0.0 else 1.0
+                cand.update_state(det['pos'], det['size'], det['ori'], sim=current_sim)
+                
                 cand.add_points(det['points'])
                 matched_det_indices.add(best_idx)
                 active_ids.add(cid)
@@ -762,7 +800,6 @@ class PersonTrackerClickInitNode(Node):
     def publish_status_marker_3d(self, header):
         marker = Marker()
         
-        # ★対策: header.frame_idが空なら埋める
         if not header.frame_id:
             header.frame_id = "livox_frame"
             
@@ -810,7 +847,6 @@ class PersonTrackerClickInitNode(Node):
         if self.target_candidate:
             target_id = self.target_candidate.id
         
-        # パーティクルの一時保管用    
         all_particles_xyz = []    
         
         for cid, cand in self.candidates.items():
@@ -850,10 +886,7 @@ class PersonTrackerClickInitNode(Node):
             # パーティクル収集
             # ==========================================
             if cand.algo == 'PF' and hasattr(cand.kf, 'particles'):
-                # ターゲットのみ表示 (必要なら外してください)
                 if is_target:
-                    # パーティクル配列 (N, 6) から XYZ (N, 3) だけをスライスで取得
-                    # コピーせず参照だけ渡すので一瞬です
                     xyz = cand.kf.particles[:, :3]
                     all_particles_xyz.append(xyz)
             # ==========================================
@@ -890,20 +923,24 @@ class PersonTrackerClickInitNode(Node):
         self.pub_markers.publish(marker_array)
         
         if len(all_particles_xyz) > 0:
-            # 全候補のパーティクルを結合 (N_total, 3)
             points_np = np.vstack(all_particles_xyz)
             
-            # NumPy構造化配列を作成 (x, y, z, rgb)
+            # --- 赤色データの作成 ---
+            red_color_int = 0xFF0000
+            red_color_float = np.array([red_color_int], dtype=np.uint32).view(np.float32)[0]
+
+            # NumPy構造化配列 (x, y, z, rgb)
             data = np.zeros(len(points_np), dtype=[
                 ('x', np.float32),
                 ('y', np.float32),
                 ('z', np.float32),
+                ('rgb', np.float32)
             ])
             data['x'] = points_np[:, 0]
             data['y'] = points_np[:, 1]
             data['z'] = points_np[:, 2]
+            data['rgb'] = red_color_float
 
-            # メッセージ作成
             msg = rnp.msgify(PointCloud2, data)
             msg.header = header
             

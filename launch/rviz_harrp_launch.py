@@ -34,24 +34,24 @@ def generate_launch_description():
     odom_topic_name = '/kachaka/odometry/odometry'
 
     return LaunchDescription([
-        #Node(
-        #    package='harrp',
-        #    executable='livox_tf_broadcaster.py',
-        #    name='odom_tf_broadcaster',
-        #    output='screen',
-        #    parameters=[{
-        #        'parent_frame': 'base_link',
-        #        'child_frame': 'livox_frame',
-        #        # 3D LiDARの位置 (kachakaのurdf基準)
-        #        'x': 0.156,
-        #        'y': 0.0,
-        #        'z': 0.1049 + 0.05,
-        #    }],
-        #    remappings=[
-        #        # オドメトリ購読用トピック
-        #        ('/odom', odom_topic_name),
-        #    ],
-        #),
+        Node(
+            package='harrp',
+            executable='livox_tf_broadcaster.py',
+            name='odom_tf_broadcaster',
+            output='screen',
+            parameters=[{
+                'parent_frame': 'base_link',
+                'child_frame': 'livox_frame',
+                # 3D LiDARの位置 (kachakaのurdf基準)
+                'x': 0.156,
+                'y': 0.0,
+                'z': 0.1049 + 0.05,
+            }],
+            remappings=[
+                # オドメトリ購読用トピック
+                ('/odom', odom_topic_name),
+            ],
+        ),
 
         Node(
             package='harrp',
