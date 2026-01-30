@@ -8,6 +8,7 @@ Panels:
         - /PointCloud21
         - /Image1/Topic1
         - /TF1/Frames1
+        - /PointCloud22
       Splitter Ratio: 0.5
     Tree Height: 1072
   - Class: rviz_common/Selection
@@ -59,7 +60,7 @@ Visualization Manager:
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
-      Max Intensity: 154
+      Max Intensity: 158
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: PointCloud2
@@ -81,7 +82,8 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        {}
+        candidates: true
+        text: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -93,7 +95,7 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        {}
+        detections: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -158,7 +160,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        safety_margin: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -170,7 +172,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        {}
+        status_3d: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -202,111 +204,59 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: false
-        __CHARGER__:
-          Value: false
-        base_footprint:
-          Value: false
-        base_l_drive_wheel_link:
-          Value: false
-        base_link:
-          Value: true
-        base_r_drive_wheel_link:
-          Value: false
-        camera_back:
-          Value: false
-        camera_back_link:
-          Value: false
-        camera_front:
-          Value: false
-        camera_front_link:
-          Value: false
-        docking_link:
-          Value: false
-        global_map-grid-base:
-          Value: false
-        home:
-          Value: false
-        imu_link:
-          Value: false
-        laser_frame:
-          Value: true
-        laser_link:
-          Value: false
-        layout_offset:
-          Value: false
-        lidar_center_frame:
-          Value: false
-        livox_frame:
-          Value: true
-        local_map-grid-base:
-          Value: false
-        local_map-lidar-map-grid-base:
-          Value: false
-        map:
-          Value: false
-        odom:
-          Value: true
-        tof_camera:
-          Value: false
-        tof_link:
-          Value: false
       Marker Scale: 1
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: false
       Tree:
-        map:
-          global_map-grid-base:
-            {}
-          layout_offset:
-            home:
-              __CHARGER__:
-                {}
-          odom:
-            base_footprint:
-              {}
-            base_link:
-              base_l_drive_wheel_link:
-                {}
-              base_r_drive_wheel_link:
-                {}
-              camera_back_link:
-                camera_back:
-                  {}
-              camera_front_link:
-                camera_front:
-                  {}
-              docking_link:
-                {}
-              imu_link:
-                {}
-              laser_link:
-                laser_frame:
-                  lidar_center_frame:
-                    {}
-              livox_frame:
-                {}
-              tof_link:
-                tof_camera:
-                  {}
-            local_map-grid-base:
-              {}
-            local_map-lidar-map-grid-base:
-              {}
+        {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true
       Name: Marker
       Namespaces:
-        {}
+        mpc_target: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /harrp/mpc/target_debug
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: PointCloud2
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.029999999329447746
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /harrp/tracker/particles
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: true
   Enabled: true
   Global Options:
@@ -351,25 +301,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 4.695019721984863
+      Distance: 7.739534378051758
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0
-        Y: 0
-        Z: 0
+        X: 0.41712865233421326
+        Y: -0.16337954998016357
+        Z: 0.6586890816688538
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.464797019958496
+      Pitch: 1.249794840812683
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 3.095471143722534
+      Yaw: 3.4654743671417236
     Saved: ~
 Window Geometry:
   Displays:

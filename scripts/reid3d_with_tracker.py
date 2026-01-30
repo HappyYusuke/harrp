@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import math
 import threading
+import struct
 
 # --- Parallel Processing Imports ---
 from concurrent.futures import ProcessPoolExecutor
@@ -24,6 +25,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA, String
 from vision_msgs.msg import Detection3DArray
 from geometry_msgs.msg import PoseStamped, Point
+from sensor_msgs.msg import PointCloud2
 
 import ros2_numpy as rnp
 
@@ -58,7 +60,7 @@ def normalize_point_cloud(points, num_points=256):
     return normalized_points
 
 # ==========================================
-# ★追加: 並列処理用のワーカー関数 (クラス外に定義)
+# 並列処理用のワーカー関数 (クラス外に定義)
 # ==========================================
 def preprocess_detection_worker(args):
     """
@@ -317,6 +319,9 @@ class PersonTrackerClickInitNode(Node):
                 ('reid.gallery_size', 100),
                 ('reid.feature_dim', 1024),
                 ('reid.num_class', 222),
+                
+                # ★追加: 本人確認用の閾値
+                ('reid.verify_thresh', 0.4),
 
                 ('detection.pca_wall_thresh', 0.35),
                 ('detection.pca_ratio_thresh', 5.0),
@@ -349,6 +354,9 @@ class PersonTrackerClickInitNode(Node):
             'gallery_size': self.get_parameter('reid.gallery_size').value,
             'reid_feature_dim': self.get_parameter('reid.feature_dim').value,
             'reid_num_class': self.get_parameter('reid.num_class').value,
+            
+            # ★追加: 辞書への保存
+            'verify_thresh': self.get_parameter('reid.verify_thresh').value,
 
             'pca_wall_thresh': self.get_parameter('detection.pca_wall_thresh').value,
             'pca_ratio_thresh': self.get_parameter('detection.pca_ratio_thresh').value,
@@ -368,6 +376,10 @@ class PersonTrackerClickInitNode(Node):
         self.get_logger().info(f"Robot Radius Filter: {self.params['robot_radius']} m")
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # PyTorchのCPUスレッド数を制限 (プロセスプールとの競合回避)
+        torch.set_num_threads(4)
+        
         self.net = self._load_model()
         self.get_logger().info(f'Model Loaded on {self.device}')
 
@@ -380,6 +392,7 @@ class PersonTrackerClickInitNode(Node):
         self.pub_status = self.create_publisher(String, 'tracker/target_status', 10)
         self.pub_status_marker = self.create_publisher(Marker, 'tracker/status_3d', 10)
         self.pub_target_pose = self.create_publisher(PoseStamped, 'tracker/target_pose', 10)
+        self.pub_particles = self.create_publisher(PointCloud2, 'tracker/particles', 10)
 
         self.state = "WAIT_FOR_CLICK"
         self.target_candidate = None    
@@ -393,8 +406,7 @@ class PersonTrackerClickInitNode(Node):
         self.is_reid_running = False
         self.reid_lock = threading.Lock()
 
-        # ★追加: プロセスプールExecutorの初期化 (前処理の並列化用)
-        # max_workersはCPUコア数に合わせて調整してください (デフォルトはNoneで自動)
+        # プロセスプールExecutorの初期化 (前処理の並列化用)
         self.process_executor = ProcessPoolExecutor(max_workers=4)
 
         if self.params['choose_target_from_rviz2'] == 1:
@@ -405,7 +417,7 @@ class PersonTrackerClickInitNode(Node):
         self.execution_count = 0
 
     def destroy_node(self):
-        # ★追加: 終了時にExecutorをシャットダウン
+        # 終了時にExecutorをシャットダウン
         self.process_executor.shutdown()
         super().destroy_node()
 
@@ -482,9 +494,21 @@ class PersonTrackerClickInitNode(Node):
                         elif mean_feat is not None:
                              sim = torch.dot(feature, mean_feat.to(self.device)).item()
                         
+                        target_cand.last_sim = sim
+
+                        # ★修正: パラメータから閾値を取得
+                        verify_thresh = self.params['verify_thresh']
+
+                        # ★追加: 本人確認ロジック
+                        if sim < verify_thresh:
+                            self.get_logger().warn(f"Low Similarity Detected! Sim: {sim:.2f} < {verify_thresh}")
+                            # --- 以下のコメントアウトを外すと、IDスイッチ時に即LOST状態になります ---
+                            # self.state = "LOST"
+                            # self.target_candidate = None # ターゲットを破棄
+                            # return
+
                         if sim > 0.6: 
                             target_cand.update_feature_gallery(feat_cpu)
-                            target_cand.last_sim = sim
 
         except Exception as e:
             self.get_logger().error(f"Async ReID Error: {e}")
@@ -524,8 +548,7 @@ class PersonTrackerClickInitNode(Node):
 
         detections = []
         
-        # ★修正: 並列処理用に引数リストを作成
-        # args_list = [(det, self.params), (det, self.params), ...]
+        # 並列処理用に引数リストを作成
         process_args = [(det, self.params) for det in msg.detections]
         
         # Executorを使って並列実行
@@ -537,8 +560,6 @@ class PersonTrackerClickInitNode(Node):
                 if res is not None:
                     detections.append(res)
         
-        # --- これまでの直列処理は削除し、上記に置き換えました ---
-
         self.update_candidates(detections, current_time)
 
         if self.state == "WAIT_FOR_CLICK":
@@ -554,8 +575,6 @@ class PersonTrackerClickInitNode(Node):
             self.process_autonomous_tracking()
             
             if self.state == "TRACKING" and self.target_candidate:
-                # 最終検出から 0.2秒 以上経過していたら、target_pose を送らない
-                # (古い相対座標を送ると、ロボットの回転に合わせてターゲットが回ってしまうため)
                 time_since_last_seen = current_time - self.target_candidate.last_seen_time
                 
                 if time_since_last_seen < 0.2:
@@ -742,6 +761,11 @@ class PersonTrackerClickInitNode(Node):
 
     def publish_status_marker_3d(self, header):
         marker = Marker()
+        
+        # ★対策: header.frame_idが空なら埋める
+        if not header.frame_id:
+            header.frame_id = "livox_frame"
+            
         marker.header = header 
         marker.ns = "status_3d"
         marker.id = 0
@@ -779,12 +803,16 @@ class PersonTrackerClickInitNode(Node):
 
     def publish_visualization(self, header):
         marker_array = MarkerArray()
-        # ★追加: ここで変数を定義して NameError を回避
         seq_len = self.params['sequence_length']
         
         target_id = -1
+        
         if self.target_candidate:
             target_id = self.target_candidate.id
+        
+        # パーティクルの一時保管用    
+        all_particles_xyz = []    
+        
         for cid, cand in self.candidates.items():
             is_target = (target_id != -1 and cid == target_id)
             mk = Marker()
@@ -818,12 +846,18 @@ class PersonTrackerClickInitNode(Node):
                 mk.color = ColorRGBA(r=0.7, g=0.7, b=0.7, a=0.3) 
             marker_array.markers.append(mk)
             
-            # --- パーティクル描画は重いのでコメントアウト推奨 ---
-            # if cand.algo == 'PF' and is_target:
-            #     p_mk = Marker()
-            #     ...
-            #     marker_array.markers.append(p_mk)
-                
+            # ==========================================
+            # パーティクル収集
+            # ==========================================
+            if cand.algo == 'PF' and hasattr(cand.kf, 'particles'):
+                # ターゲットのみ表示 (必要なら外してください)
+                if is_target:
+                    # パーティクル配列 (N, 6) から XYZ (N, 3) だけをスライスで取得
+                    # コピーせず参照だけ渡すので一瞬です
+                    xyz = cand.kf.particles[:, :3]
+                    all_particles_xyz.append(xyz)
+            # ==========================================
+            
             text = Marker()
             text.header = header
             text.ns = "text"
@@ -852,7 +886,28 @@ class PersonTrackerClickInitNode(Node):
             text.text = label
             text.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
             marker_array.markers.append(text)
+            
         self.pub_markers.publish(marker_array)
+        
+        if len(all_particles_xyz) > 0:
+            # 全候補のパーティクルを結合 (N_total, 3)
+            points_np = np.vstack(all_particles_xyz)
+            
+            # NumPy構造化配列を作成 (x, y, z, rgb)
+            data = np.zeros(len(points_np), dtype=[
+                ('x', np.float32),
+                ('y', np.float32),
+                ('z', np.float32),
+            ])
+            data['x'] = points_np[:, 0]
+            data['y'] = points_np[:, 1]
+            data['z'] = points_np[:, 2]
+
+            # メッセージ作成
+            msg = rnp.msgify(PointCloud2, data)
+            msg.header = header
+            
+            self.pub_particles.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)

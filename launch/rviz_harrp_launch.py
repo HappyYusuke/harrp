@@ -93,10 +93,10 @@ def generate_launch_description():
             output='screen',
         ),
 
-        #Node(
-        #    package='rviz2',
-        #    executable='rviz2',
-        #    name='rviz2',
-        #    arguments=['-d', rviz_config, '--ros-args', '--log-level', 'fatal'],
-        #)
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            arguments=['-d', rviz_config, '--ros-args', '--log-level', 'fatal'],
+        )
     ])
