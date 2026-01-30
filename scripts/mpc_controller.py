@@ -20,6 +20,92 @@ from scipy.optimize import minimize
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 
+# ★追加: NumbaによるJITコンパイル (爆速化の鍵)
+from numba import jit
+
+# ==========================================
+# ★高速化部分: クラス外に出してJITコンパイル
+# Pythonのループ処理をC言語並みの速度に変換します
+# ==========================================
+@jit(nopython=True, cache=True)
+def predict_next_state_jit(state, v, w, dt):
+    x, y, yaw, _, _ = state
+    x += v * np.cos(yaw) * dt
+    y += v * np.sin(yaw) * dt
+    yaw += w * dt
+    # 角度正規化 (-pi ~ pi)
+    yaw = (yaw + np.pi) % (2 * np.pi) - np.pi
+    return np.array([x, y, yaw, v, w])
+
+@jit(nopython=True, cache=True)
+def mpc_cost_jit(u_flat, current_state, target, obstacles, 
+                 horizon, dt, 
+                 w_dist, w_heading, w_vel, w_obs, 
+                 max_speed, robot_radius):
+    
+    cost = 0.0
+    # 状態変数のコピー (JIT内で変更するため)
+    curr_state = current_state.copy()
+    
+    # 入力配列の変形
+    u = u_flat.reshape((horizon, 2))
+    
+    for i in range(horizon):
+        v = u[i, 0]
+        w = u[i, 1]
+        
+        # 次の状態を予測
+        curr_state = predict_next_state_jit(curr_state, v, w, dt)
+        px = curr_state[0]
+        py = curr_state[1]
+        pyaw = curr_state[2]
+        
+        # --- ゴール到達コスト ---
+        dx = target[0] - px
+        dy = target[1] - py
+        dist = np.sqrt(dx*dx + dy*dy)
+        cost += w_dist * dist
+        
+        # --- 向きのコスト ---
+        target_yaw = np.arctan2(dy, dx)
+        yaw_diff = np.abs(target_yaw - pyaw)
+        yaw_diff = (yaw_diff + np.pi) % (2 * np.pi) - np.pi
+        cost += w_heading * np.abs(yaw_diff)
+        
+        # --- 速度維持コスト ---
+        # ゴールまで1m以上あれば最高速度、近ければ減速
+        target_v = max_speed if dist > 1.0 else 0.0
+        cost += w_vel * np.abs(target_v - v)
+        
+        # --- 障害物回避コスト (ここが一番重い処理) ---
+        if len(obstacles) > 0:
+            # 配列演算で一括計算 (Numbaならループでも速いが、Broadcastingも速い)
+            # 障害物との距離の最小値を求める
+            # dxs = obstacles[:, 0] - px
+            # dys = obstacles[:, 1] - py
+            # dists = np.sqrt(dxs**2 + dys**2)
+            # min_obs_dist = np.min(dists)
+            
+            # Numba最適化ループ版 (メモリ確保を避けるため手動ループ)
+            min_obs_dist = 10000.0
+            for j in range(len(obstacles)):
+                ox = obstacles[j, 0]
+                oy = obstacles[j, 1]
+                odist = np.sqrt((ox - px)**2 + (oy - py)**2)
+                if odist < min_obs_dist:
+                    min_obs_dist = odist
+
+            if min_obs_dist < robot_radius:
+                # 衝突時のペナルティ (非常に大きく)
+                cost += w_obs * (1.0 / (min_obs_dist + 0.001)) * 100.0
+            elif min_obs_dist < robot_radius + 0.5:
+                # 接近時のペナルティ
+                cost += w_obs * (1.0 / min_obs_dist)
+                
+    return cost
+
+# ==========================================
+
 class MPCConfig:
     def __init__(self):
         # --- 制約条件 ---
@@ -34,7 +120,7 @@ class MPCConfig:
         self.horizon = 8        
         
         # --- 重み付け ---
-        self.w_dist = 1.0       
+        self.w_dist = 1.0        
         self.w_heading = 0.5    
         self.w_vel = 1.5        
         self.w_obs = 0.8        
@@ -90,7 +176,7 @@ class MPCController(Node):
         self.update_config_from_params()
         self.add_on_set_parameters_callback(self.parameter_callback)
 
-        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_pub = self.create_publisher(Path, 'mpc/predict_path', 10)
         self.obs_pub = self.create_publisher(Marker, 'mpc/obstacles', 10)
         self.robot_radius_pub = self.create_publisher(Marker, 'mpc/robot_radius', 10)
@@ -110,7 +196,6 @@ class MPCController(Node):
             PoseStamped, 'tracker/target_pose', self.target_callback, 10, 
             callback_group=self.cb_group
         )
-        # PointCloud2はデータ量が多いため、QoSを調整
         self.create_subscription(
             PointCloud2, '/livox/lidar', self.lidar_callback, 10, 
             callback_group=self.cb_group
@@ -129,7 +214,8 @@ class MPCController(Node):
         self.sensor_frame_id = "livox_frame"
         self.is_tracker_lost = False
         
-        self.obstacles_local = np.array([])
+        # Numba用に float64 で初期化しておくことが望ましい
+        self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
         
         self.prev_solution = np.zeros(self.config.horizon * 2)
         self.prev_yaw_error = None
@@ -197,52 +283,33 @@ class MPCController(Node):
             pass
 
     def lidar_callback(self, msg):
-        """
-        NumPyを使った高速かつ堅牢な点群処理
-        point_stepがfloat32(4byte)の倍数でない場合でもズレないように修正
-        """
         self.sensor_frame_id = msg.header.frame_id
-        self.lidar_header_stamp = msg.header.stamp
-        
         try:
             point_step = msg.point_step
-            # 1. バイト列として一括読み込み
             raw_uint8 = np.frombuffer(msg.data, dtype=np.uint8)
             
-            # 2. ポイント数を確認してリシェイプ [N, point_step]
-            # これにより、1点ごとの区切りをバイト単位で正確に守ります
             if len(raw_uint8) % point_step != 0:
-                self.get_logger().warn("PointCloud data size is not a multiple of point_step!")
                 return
             
             num_points = len(raw_uint8) // point_step
             points_data = raw_uint8.reshape(num_points, point_step)
             
-            # 3. x, y, z のバイト列を抽出して float32 に変換
-            # オフセットは通常 0, 4, 8 です
-            # .copy() を入れてメモリを連続させてから view() します
             x_bytes = points_data[:, 0:4].copy().view(dtype=np.float32).reshape(-1)
             y_bytes = points_data[:, 4:8].copy().view(dtype=np.float32).reshape(-1)
             z_bytes = points_data[:, 8:12].copy().view(dtype=np.float32).reshape(-1)
             
-            # 4. (N, 3) の座標配列を作成
             xyz = np.stack((x_bytes, y_bytes, z_bytes), axis=1)
             
-            # --- 以下フィルタリング (既存) ---
-            
-            # NaN/Inf 除去
             mask_valid = np.isfinite(xyz).all(axis=1)
             xyz = xyz[mask_valid]
             
             if xyz.shape[0] == 0:
-                self.obstacles_local = np.array([])
+                self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
                 return
 
-            # 高さフィルタ
             mask_z = (xyz[:, 2] > self.config.min_height) & (xyz[:, 2] < self.config.max_height)
             xyz = xyz[mask_z]
             
-            # 距離フィルタ
             dists = np.linalg.norm(xyz[:, :2], axis=1)
             mask_dist = (dists > self.config.robot_radius) & (dists < 5.0)
             xyz = xyz[mask_dist]
@@ -251,52 +318,39 @@ class MPCController(Node):
             xyz = xyz[::5] 
             
             if xyz.shape[0] > 0:
+                # Numba用に必ずfloat64にする
                 self.obstacles_local = xyz[:, :2].astype(np.float64)
             else:
-                self.obstacles_local = np.array([])
+                self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
                 
         except Exception as e:
             self.get_logger().warn(f"Lidar Processing Error: {e}")
-            self.obstacles_local = np.array([])
+            self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
 
     def get_target_for_mpc(self):
-        # 最後に受信してから一定時間経ったらリセットする処理
         if self.last_target_time is None:
             return None
 
         elapsed = (self.get_clock().now() - self.last_target_time).nanoseconds / 1e9
         is_lost_condition = self.is_tracker_lost or (elapsed > self.config.lost_timeout)
         
-        # --- A. トラッキング中 (通常) ---
         if not is_lost_condition:
-            # センサー座標系(livox_frame)などの相対座標をそのまま使う
             return self.target_local
-
-        # --- B. 見失った場合 (Odom座標から復元) ---
         else:
             if self.target_odom is None:
                 return None
-            
             try:
-                # ★修正ポイント: 
-                # 過去のPoseStampedをそのまま使うと、TFは「過去のロボット位置」基準で計算してしまう。
-                # 「現在のロボット位置」基準で計算させるため、タイムスタンプを最新(0)にする。
-                
-                # 1. データをコピー (元のself.target_odomを書き換えないため)
-                #    ※ copyモジュールがない場合は import copy してください
-                #    簡易的に新しいPoseStampedを作ります
+                # ★修正: タイムスタンプを最新にしてから変換 (ロボットが動いてもターゲット位置を固定するため)
                 current_target_in_odom = PoseStamped()
-                current_target_in_odom.header.frame_id = self.target_odom.header.frame_id # 'odom'
-                current_target_in_odom.header.stamp = rclpy.time.Time().to_msg() # ★時刻を「最新」にする
-                current_target_in_odom.pose = self.target_odom.pose # 座標は過去に覚えた絶対位置
+                current_target_in_odom.header.frame_id = self.target_odom.header.frame_id
+                current_target_in_odom.header.stamp = rclpy.time.Time().to_msg()
+                current_target_in_odom.pose = self.target_odom.pose
 
-                # 2. 現在の base_link 基準に変換
                 target_recovered = self.tf_buffer.transform(
                     current_target_in_odom, 
-                    'base_link',  # 現在のロボット中心基準
+                    'base_link', 
                     timeout=rclpy.duration.Duration(seconds=0.1)
                 )
-                
                 return np.array([target_recovered.pose.position.x, target_recovered.pose.position.y])
 
             except (LookupException, ConnectivityException, ExtrapolationException) as e:
@@ -304,6 +358,7 @@ class MPCController(Node):
                 return None
 
     def predict_next_state(self, state, v, w, dt):
+        # 可視化パスの生成用（JIT版と同じ計算だがクラスメソッドとして残しておく）
         x, y, yaw, _, _ = state
         x += v * math.cos(yaw) * dt
         y += v * math.sin(yaw) * dt
@@ -311,48 +366,11 @@ class MPCController(Node):
         yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
         return np.array([x, y, yaw, v, w])
 
-    # ★修正: obstacles引数を追加 (スナップショットを受け取る)
-    def cost_function(self, u_flat, current_target, current_obstacles):
-        cost = 0.0
-        curr_state = np.array([0.0, 0.0, 0.0, self.current_vel, self.current_yaw_rate])
-        u = u_flat.reshape(self.config.horizon, 2)
-        
-        for i in range(self.config.horizon):
-            v, w = u[i]
-            curr_state = self.predict_next_state(curr_state, v, w, self.config.dt)
-            px, py, pyaw, _, _ = curr_state
-            
-            dx = current_target[0] - px
-            dy = current_target[1] - py
-            dist = math.hypot(dx, dy)
-            cost += self.config.w_dist * dist
-            
-            target_yaw = math.atan2(dy, dx)
-            yaw_diff = abs(target_yaw - pyaw)
-            yaw_diff = (yaw_diff + math.pi) % (2 * math.pi) - math.pi
-            cost += self.config.w_heading * abs(yaw_diff)
-            
-            target_v = self.config.max_speed if dist > 1.0 else 0.0
-            cost += self.config.w_vel * abs(target_v - v)
-            
-            # ★修正: クラス変数の代わりに引数の current_obstacles を使用
-            if len(current_obstacles) > 0:
-                dx_obs = current_obstacles[:, 0] - px
-                dy_obs = current_obstacles[:, 1] - py
-                obs_dists = np.hypot(dx_obs, dy_obs)
-                min_obs_dist = np.min(obs_dists)
-                if min_obs_dist < self.config.robot_radius:
-                    cost += self.config.w_obs * (1.0 / (min_obs_dist + 0.01)) * 100
-                elif min_obs_dist < self.config.robot_radius + 0.5:
-                    cost += self.config.w_obs * (1.0 / min_obs_dist)
-        return cost
-
     def run_mpc(self):
         target = self.get_target_for_mpc()
         if target is None:
             return 0.0, 0.0, []
 
-        # ★修正: 障害物情報のコピーを作成してスナップショット化 (競合回避)
         obstacles_snapshot = self.obstacles_local.copy()
 
         dx = target[0]
@@ -390,14 +408,23 @@ class MPCController(Node):
         x0 = np.roll(self.prev_solution, -2)
         x0[-2:] = 0.0
 
-        # ★修正: obstacles_snapshot を渡す
+        # 初期状態: [x=0, y=0, yaw=0, v, w] (ローカル座標系なので位置は0)
+        current_state = np.array([0.0, 0.0, 0.0, self.current_vel, self.current_yaw_rate], dtype=np.float64)
+
+        # ★高速化: argsの数を減らし、JIT関数を呼び出す形に変更
+        # minimizeはパラメータが多いと遅くなることがあるので、tolを少し緩めるのも手です (1e-3 -> 1e-2)
         res = minimize(
-            self.cost_function, 
+            mpc_cost_jit, 
             x0, 
-            args=(target, obstacles_snapshot),
+            args=(
+                current_state, target, obstacles_snapshot, 
+                self.config.horizon, self.config.dt, 
+                self.config.w_dist, self.config.w_heading, self.config.w_vel, self.config.w_obs,
+                self.config.max_speed, self.config.robot_radius
+            ),
             method='SLSQP', 
             bounds=bounds, 
-            tol=1e-3
+            tol=1e-2  # 少し緩めることで収束を早める
         )
         
         if res.success:
@@ -405,7 +432,9 @@ class MPCController(Node):
             v_cmd = res.x[0]
             w_cmd = res.x[1]
             predict_path = []
-            curr_state = np.array([0.0, 0.0, 0.0, self.current_vel, self.current_yaw_rate])
+            
+            # 予測パス生成（可視化用）
+            curr_state = current_state.copy()
             u = res.x.reshape(self.config.horizon, 2)
             for i in range(self.config.horizon):
                 curr_state = self.predict_next_state(curr_state, u[i][0], u[i][1], self.config.dt)
@@ -419,7 +448,9 @@ class MPCController(Node):
         if not trajectory: return
         path_msg = Path()
         path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = self.sensor_frame_id
+        # トラッキング中もロスト中も、pathは計算基準となったフレーム(base_link相当)で出す
+        # 厳密にはsensor_frame_id (livox_frame) だが、offset=0ならほぼbase_link
+        path_msg.header.frame_id = "base_link" 
         for point in trajectory:
             pose = PoseStamped()
             pose.pose.position.x = point[0]
@@ -440,21 +471,18 @@ class MPCController(Node):
         marker.scale.y = 0.05
         marker.color.r = 1.0; marker.color.a = 1.0
         
-        # 配列が空でないか再確認
         if self.obstacles_local.shape[0] > 0:
-            # ★修正: floatへの明示的キャスト (AssertionError対策)
-            # Numpyの配列をPythonのリストに変換してからイテレートする方が安全
             for obs in self.obstacles_local:
                 p = Point()
-                p.x = float(obs[0]) # ここが重要
-                p.y = float(obs[1]) # ここが重要
+                p.x = float(obs[0])
+                p.y = float(obs[1])
                 marker.points.append(p)
         
         self.obs_pub.publish(marker)
         
     def publish_robot_radius(self):
         marker = Marker()
-        marker.header.frame_id = self.sensor_frame_id
+        marker.header.frame_id = "base_link" # 半径表示は常にロボット中心
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "safety_margin"
         marker.id = 0
@@ -480,7 +508,6 @@ class MPCController(Node):
         
         marker = Marker()
         
-        # ★修正: トラッキング中かロスト中かで、座標系が変わるため frame_id を切り替える
         elapsed = 0.0
         if self.last_target_time is not None:
             elapsed = (self.get_clock().now() - self.last_target_time).nanoseconds / 1e9
@@ -488,10 +515,8 @@ class MPCController(Node):
         is_lost = self.is_tracker_lost or (elapsed > self.config.lost_timeout)
 
         if is_lost:
-            # ロスト時は get_target_for_mpc が 'base_link' 基準の値を返す
             marker.header.frame_id = "base_link"
         else:
-            # トラッキング中は target_callback で受け取ったセンサー座標系 (例: livox_frame)
             marker.header.frame_id = self.sensor_frame_id
 
         marker.header.stamp = self.get_clock().now().to_msg()
@@ -523,6 +548,7 @@ class MPCController(Node):
         msg = Twist()
         msg.linear.x = float(v)
         msg.angular.z = float(w)
+        # ★コメントアウト解除: 実際にロボットを動かす
         self.cmd_vel_pub.publish(msg)
         self.publish_path(path)
         self.publish_obstacles()

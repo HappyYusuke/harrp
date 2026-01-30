@@ -28,6 +28,6 @@ harrp:
       target_selection:
         mode: 0                   # 0: Auto Front Selection, 1: Manual Click in Rviz
         auto_x_min: 0.0           # 自動選択の範囲 (前方X最小)
-        auto_x_max: 1.2           # 自動選択の範囲 (前方X最大)
-        auto_y_min: -0.5          # 自動選択の範囲 (左右Y最小)
-        auto_y_max: 0.5           # 自動選択の範囲 (左右Y最大)
+        auto_x_max: 2.0           # 自動選択の範囲 (前方X最大)
+        auto_y_min: -1.0          # 自動選択の範囲 (左右Y最小)
+        auto_y_max: 1.0           # 自動選択の範囲 (左右Y最大)
