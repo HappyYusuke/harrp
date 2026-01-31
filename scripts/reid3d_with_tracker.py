@@ -274,7 +274,7 @@ class Candidate:
         self.orientation = orientation
         self.queue = collections.deque(maxlen=params['sequence_length'])
         self.queue.append(initial_points)
-        self.last_sim = 0.0
+        self.last_sim = 0.5 # 初期値
         self.feature_gallery = collections.deque(maxlen=params['gallery_size'])
         self.algo = params['tracking_algo']
         
@@ -429,12 +429,13 @@ class PersonTrackerClickInitNode(Node):
         self.captured_frames_count = 0 
         self.candidates = {} 
         self.next_candidate_id = 0
-        self.reid_thread = None
         
-        # リカバリー用の非同期スレッド
+        # 非同期処理管理
+        self.reid_thread = None
         self.recovery_thread = None
         self.is_reid_running = False
         self.is_recovery_running = False
+        self.is_processing_reid_update = False # ★追加: update_candidates用フラグ
         self.reid_lock = threading.Lock()
         
         self.execution_count = 0
@@ -482,7 +483,6 @@ class PersonTrackerClickInitNode(Node):
         return feats[0] if feats is not None else None
     
     def async_reid_worker(self, target_cand, points_seq, mode="UPDATE"):
-        """ ギャラリー更新用の非同期ワーカー """
         try:
             feature = self.extract_feature_single(points_seq)
             if feature is None: return
@@ -507,55 +507,77 @@ class PersonTrackerClickInitNode(Node):
         finally: self.is_reid_running = False
 
     def async_recovery_worker(self, snapshot_candidates):
-        """ LOST時のリカバリー用非同期ワーカー (3人ずつミニバッチ) """
         try:
-            BATCH_SIZE = 3 # 3人ずつ処理してメモリ溢れを防ぐ
+            BATCH_SIZE = 3
             reg_feat = self.registered_feature.to(self.device)
             if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
 
             found_match = False
             best_match_info = None
 
-            # ミニバッチループ
             for i in range(0, len(snapshot_candidates), BATCH_SIZE):
                 batch_cands = snapshot_candidates[i : i + BATCH_SIZE]
                 batch_input = [c['queue'] for c in batch_cands]
-                
-                # 推論実行 (重い処理)
                 features = self.extract_features_batch(batch_input)
                 
                 if features is not None:
                     sim_scores = torch.mm(features, reg_feat.T).squeeze(1).cpu().numpy()
                     if sim_scores.ndim == 0: sim_scores = [sim_scores]
-                    
                     best_idx_local = np.argmax(sim_scores)
                     best_sim = float(sim_scores[best_idx_local])
-                    
                     if best_sim > self.params['reid_sim_thresh']:
-                        # マッチしたらその候補情報を保存してループを抜ける
                         found_match = True
                         best_match_info = (batch_cands[best_idx_local]['id'], best_sim)
                         break
             
-            # メインスレッドの状態を更新
             if found_match and best_match_info:
                 cid, sim = best_match_info
-                # 候補が存在するか再確認 (非同期中に消えている可能性があるため)
                 if cid in self.candidates:
                     cand = self.candidates[cid]
                     self.get_logger().info(f">>> RECOVERY SUCCEEDED! New ID:{cid} (Sim: {sim:.2f})")
-                    
                     old_gallery = self.target_candidate.feature_gallery if self.target_candidate else None
                     self.target_candidate = cand
                     self.target_candidate.last_sim = sim
-                    if old_gallery:
-                        self.target_candidate.feature_gallery = old_gallery
+                    if old_gallery: self.target_candidate.feature_gallery = old_gallery
                     self.state = "TRACKING"
-
         except Exception as e:
             self.get_logger().error(f"Recovery Err: {e}")
         finally:
             self.is_recovery_running = False
+
+    # ★追加: バックグラウンドでReIDスコアを更新するワーカー
+    def async_sim_update_worker(self, reid_jobs):
+        """ 
+        reid_jobs: list of (cid, points) 
+        指定された候補者に対してReIDを実行し、last_simを更新する
+        """
+        try:
+            BATCH_SIZE = 3
+            reg_feat = self.registered_feature.to(self.device)
+            if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
+
+            for i in range(0, len(reid_jobs), BATCH_SIZE):
+                batch = reid_jobs[i : i + BATCH_SIZE]
+                batch_input = [[item[1]] * self.params['sequence_length'] for item in batch]
+                
+                features = self.extract_features_batch(batch_input)
+                if features is not None:
+                    # 行列積 (Batch, Dim) x (Dim, 1) -> (Batch, 1)
+                    sim_matrix = torch.mm(features, reg_feat.T)
+                    
+                    # 1次元配列に平坦化 (Batch,)
+                    # これにより squeeze の挙動による次元トラブルを防ぎます
+                    sim_scores = sim_matrix.flatten().cpu().numpy()
+                    
+                    # zipを使って安全にループ (インデックスエラー回避)
+                    for (cid, _), score in zip(batch, sim_scores):
+                        if cid in self.candidates:
+                            self.candidates[cid].last_sim = float(score)
+                            
+        except Exception as e:
+            self.get_logger().error(f"Sim Update Err: {e}")
+        finally:
+            self.is_processing_reid_update = False
 
     def goal_callback(self, msg: PoseStamped):
         if self.params['choose_target_from_rviz2'] == 0: return
@@ -649,8 +671,10 @@ class PersonTrackerClickInitNode(Node):
         used_det_indices = set()
         match_dist = self.params['match_dist_thresh']
         
-        # --- ペアリングと更新 (Adaptive ReID: Target & Neighbors) ---
-        reid_needed_pairs = [] # (dist, r, c, cid, det)
+        # --- ペアリングと即時位置更新 ---
+        
+        # ReID確認が必要な候補リスト (あとで非同期処理に投げる)
+        reid_jobs = [] # (cid, points)
         
         target_pos = None
         if self.target_candidate:
@@ -662,65 +686,40 @@ class PersonTrackerClickInitNode(Node):
             
             cid = cand_ids[r]
             cand = self.candidates[cid]
-            is_target = (self.target_candidate and self.target_candidate.id == cid)
+            det = detections[c]
             
-            # ★周辺チェック: ターゲットに近い候補もReID計算対象にする
+            # マッチ成立: 即座に位置更新 (ReIDスコアは前回のキャッシュを使用)
+            used_cand_indices.add(r)
+            used_det_indices.add(c)
+            
+            # 位置更新には「前回のスコア」を使う（なければ0.5）
+            cached_sim = cand.last_sim if cand.last_sim > 0.001 else 0.5
+            cand.update_state([det], sim_map={0: cached_sim})
+            cand.add_points(det['points'])
+            active_ids.add(cid)
+            
+            # --- ReIDが必要か判定 ---
+            is_target = (self.target_candidate and self.target_candidate.id == cid)
             is_neighbor = False
             if target_pos is not None and not is_target:
                 dist_to_target = np.linalg.norm(cand.pos - target_pos)
-                if dist_to_target < 2.0: # 2m以内なら類似度を計算して表示
-                    is_neighbor = True
+                if dist_to_target < 2.0: is_neighbor = True
 
             should_run_reid = (is_target or is_neighbor) and (self.registered_feature is not None)
             
             if should_run_reid:
                 # ターゲット本人の場合、距離が非常に近ければスキップ(最適化)
                 if is_target and dist < 0.8:
-                    used_cand_indices.add(r)
-                    used_det_indices.add(c)
-                    cand.update_state([detections[c]], sim_map={0: cand.last_sim}) 
-                    cand.add_points(detections[c]['points'])
-                    active_ids.add(cid)
+                    pass # 更新不要
                 else:
-                    # ターゲットが少し離れている、または周辺人物の場合 -> ReID実行
-                    reid_needed_pairs.append((r, c, cid, detections[c]))
-                    used_cand_indices.add(r)
-                    used_det_indices.add(c)
-            else:
-                # ターゲットから遠い他人 -> ReID不要
-                used_cand_indices.add(r)
-                used_det_indices.add(c)
-                cand.update_state([detections[c]], sim_map={0: 1.0})
-                cand.add_points(detections[c]['points'])
-                active_ids.add(cid)
+                    # リストに追加 (あとで別スレッドで処理)
+                    reid_jobs.append((cid, det['points']))
 
-        # ReID一括実行 (Batch)
-        if reid_needed_pairs:
-            batch_input = [[p[3]['points']] * self.params['sequence_length'] for p in reid_needed_pairs]
-            features = self.extract_features_batch(batch_input)
-            
-            if features is not None:
-                reg_feat = self.registered_feature.to(self.device)
-                if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
-                
-                sim_scores = torch.mm(features, reg_feat.T).squeeze(1).cpu().numpy()
-                
-                # スコアが1つの場合スカラーになるので配列化
-                if sim_scores.ndim == 0: sim_scores = [sim_scores]
-
-                for i, (r, c, cid, det) in enumerate(reid_needed_pairs):
-                    score = float(sim_scores[i])
-                    cand = self.candidates[cid]
-                    cand.last_sim = score
-                    cand.update_state([det], sim_map={0: score})
-                    cand.add_points(det['points'])
-                    active_ids.add(cid)
-            else:
-                for r, c, cid, det in reid_needed_pairs:
-                    cand = self.candidates[cid]
-                    cand.update_state([det], sim_map={0: 0.5})
-                    cand.add_points(det['points'])
-                    active_ids.add(cid)
+        # ★高速化の肝: ReID処理をバックグラウンドに投げる
+        if reid_jobs and not self.is_processing_reid_update:
+            self.is_processing_reid_update = True
+            # スレッド開始 (メイン処理を止めない)
+            threading.Thread(target=self.async_sim_update_worker, args=(reid_jobs,)).start()
 
         # 5. 未割り当て処理
         for r, cid in enumerate(cand_ids):
@@ -786,10 +785,8 @@ class PersonTrackerClickInitNode(Node):
             self.state = "LOST"
             self.pub_status.publish(String(data="LOST - Searching..."))
 
-            # ★修正: リカバリー処理を非同期スレッドへ (高速化 & 並列化)
+            # リカバリー処理 (非同期)
             if self.registered_feature is not None and not self.is_recovery_running:
-                
-                # スナップショットを作成してスレッドに渡す
                 snapshot_candidates = []
                 for cid, cand in self.candidates.items():
                     if len(cand.queue) >= 3: 
@@ -828,7 +825,6 @@ class PersonTrackerClickInitNode(Node):
             if cand.algo == 'PF' and hasattr(cand.kf, 'particles') and is_target:
                 all_particles_xyz.append(cand.kf.particles[:, :3])
             
-            # --- Text Marker (ID & Sim) ---
             text = Marker(); text.header = header; text.ns = "text"; text.id = cid; text.type = Marker.TEXT_VIEW_FACING; text.action = Marker.ADD
             text.pose.position.x, text.pose.position.y, text.pose.position.z = cand.pos[0], cand.pos[1], cand.pos[2]+1.0
             text.scale.z = 0.3; text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0); text.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
@@ -838,7 +834,7 @@ class PersonTrackerClickInitNode(Node):
                 label += f"\nSim:{cand.last_sim:.2f}"
             if is_target:
                 label += "\n[TARGET]"
-                text.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0) # ターゲットは緑文字
+                text.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0) 
             
             text.text = label
             marker_array.markers.append(text)
