@@ -9,10 +9,10 @@ import torch
 import torch.nn.functional as F
 import math
 import threading
-import struct # PointCloud2の色変換用
+import struct
 
 # --- Parallel Processing Imports ---
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 # --- FilterPy Imports ---
 from filterpy.kalman import UnscentedKalmanFilter as UKF
@@ -30,7 +30,7 @@ from sensor_msgs.msg import PointCloud2
 import ros2_numpy as rnp
 
 # ============================
-# ReIDモデル設定 (パス解決用)
+# ReIDモデル設定
 # ============================
 HOME_DIR = os.environ['HOME']
 sys.path.insert(0, f'{HOME_DIR}/ReID3D/reidnet/')
@@ -40,10 +40,12 @@ sys.argv = [original_argv[0]]
 try:
     from model import network
 except ImportError:
-    print("Warning: Could not import 'model.network' at global scope. Check paths.")
+    print("Warning: Could not import 'model.network'. Check paths.")
 sys.argv = original_argv
-# ============================
 
+# ============================
+# Helper Functions
+# ============================
 def normalize_point_cloud(points, num_points=256):
     if points.shape[0] == 0:
         return np.zeros((num_points, 3))
@@ -59,12 +61,8 @@ def normalize_point_cloud(points, num_points=256):
         normalized_points = np.vstack((points_centered, additional_points))
     return normalized_points
 
-# ==========================================
-# 並列処理用のワーカー関数 (クラス外に定義)
-# ==========================================
-def preprocess_detection_worker(args):
-    detection, params = args
-
+def preprocess_detection(detection, params):
+    """ 前処理関数 (シングルスレッド実行) """
     if detection.source_cloud.width * detection.source_cloud.height == 0:
         return None
 
@@ -76,7 +74,7 @@ def preprocess_detection_worker(args):
     if raw_points.shape[0] < params['min_points']:
         return None
     
-    # --- PCAフィルタ (壁・ポール対策) ---
+    # PCAフィルタ
     points_xy = raw_points[:, :2]
     mean_xy = np.mean(points_xy, axis=0)
     centered_xy = points_xy - mean_xy
@@ -94,13 +92,11 @@ def preprocess_detection_worker(args):
     std_minor = np.sqrt(lambda2) 
     
     if std_major > params['pca_wall_thresh']: return None
-    ratio = std_major / std_minor
-    if ratio > params['pca_ratio_thresh']: return None
+    if (std_major / std_minor) > params['pca_ratio_thresh']: return None
     
     dists_from_center = np.linalg.norm(centered_xy, axis=1)
     std_radial = np.std(dists_from_center)
     if std_radial < params['pca_radial_thresh']: return None
-    # -----------------------------------
 
     norm_points = normalize_point_cloud(raw_points, num_points=params['normalize_num_points'])
     bbox = detection.bbox
@@ -115,26 +111,21 @@ def preprocess_detection_worker(args):
         'pos': pos,
         'size': size,
         'ori': bbox.center.orientation,
-        'points': norm_points
+        'points': norm_points,
+        'sim': 1.0 # 初期値
     }
 
 # ==========================================
-# 1. Particle Filter Implementation (With Mahalanobis & ReID Likelihood)
-# ==========================================
-# ==========================================
-# 1. Particle Filter Implementation (Fix: Add missing estimate method)
+# 1. Particle Filter Implementation (Optimized)
 # ==========================================
 class ParticleFilterTracker(object):
     def __init__(self, initial_pos, params):
         self.num_particles = params['pf_num_particles']
-        self.particles = np.zeros((self.num_particles, 6))
+        self.particles = np.zeros((self.num_particles, 6)) 
         
-        # 初期化: Z方向のばらつきは小さめに
         self.particles[:, 0] = initial_pos[0] + np.random.randn(self.num_particles) * 0.1
         self.particles[:, 1] = initial_pos[1] + np.random.randn(self.num_particles) * 0.1
-        self.particles[:, 2] = initial_pos[2] + np.random.randn(self.num_particles) * 0.02 
-        
-        # 速度初期値: Z速度はほぼ0にする
+        self.particles[:, 2] = initial_pos[2] + np.random.randn(self.num_particles) * 0.02
         self.particles[:, 3:5] = np.random.randn(self.num_particles, 2) * 0.1
         self.particles[:, 5]   = np.random.randn(self.num_particles) * 0.01 
         
@@ -143,13 +134,15 @@ class ParticleFilterTracker(object):
         self.x = np.zeros(6)
         self.x[:3] = initial_pos
         
+        self.estimated_yaw = 0.0
+        
         self.process_noise_pos = params['pf_process_noise_pos']
         self.process_noise_vel = params['pf_process_noise_vel']
         
-        # --- マハラノビス距離用パラメータ ---
-        self.std_long = params['pf_std_long'] 
-        self.std_lat = params['pf_std_lat']
-        # Z方向(高さ)の許容誤差
+        self.std_stopped = params['pf_std_stopped']
+        self.std_long_max = params['pf_std_long_max']
+        self.std_lat_max = params['pf_std_lat_max']
+        self.speed_ref = params['pf_max_speed_ref']
         self.std_z = 0.1 
 
     def predict(self, current_time):
@@ -159,133 +152,121 @@ class ParticleFilterTracker(object):
             dt = current_time - self.last_timestamp
         self.last_timestamp = current_time
         
-        # 位置更新
         self.particles[:, 0] += self.particles[:, 3] * dt
         self.particles[:, 1] += self.particles[:, 4] * dt
         self.particles[:, 2] += self.particles[:, 5] * dt
         
-        # --- プロセスノイズの適用 (Z方向を抑制) ---
-        # XYには設定通りのノイズ
         self.particles[:, :2] += np.random.randn(self.num_particles, 2) * self.process_noise_pos
-        # Zには非常に小さいノイズのみ与える
         self.particles[:, 2]  += np.random.randn(self.num_particles) * (self.process_noise_pos * 0.1)
-
-        # 速度更新 (XYのみ)
         self.particles[:, 3:5] += np.random.randn(self.num_particles, 2) * self.process_noise_vel
-        # Z速度は減衰させる
         self.particles[:, 5] *= 0.5 
         
         self.estimate()
+        self._update_estimated_yaw()
         return self.x[:3]
 
-    def update(self, measurement, reid_sim=1.0, target_yaw=0.0):
-        """
-        マハラノビス距離(XY) + 単純ガウス(Z) + ReID尤度
-        """
-        # --- 1. XY平面のマハラノビス距離計算 ---
-        cov_local = np.diag([self.std_long**2, self.std_lat**2])
+    def _update_estimated_yaw(self):
+        vx = self.x[3]
+        vy = self.x[4]
+        speed = np.hypot(vx, vy)
+        if speed > 0.1: 
+            self.estimated_yaw = np.arctan2(vy, vx)
+
+    def _get_adaptive_covariance(self):
+        vx = self.x[3]
+        vy = self.x[4]
+        current_speed = np.hypot(vx, vy)
         
-        c, s = np.cos(target_yaw), np.sin(target_yaw)
-        rot_mat = np.array([[c, -s], 
-                            [s,  c]])
+        ratio = min(current_speed / self.speed_ref, 1.0)
+        curr_long = self.std_stopped + (self.std_long_max - self.std_stopped) * ratio
+        curr_lat  = self.std_stopped + (self.std_lat_max  - self.std_stopped) * ratio
         
-        cov_global = rot_mat @ cov_local @ rot_mat.T
+        yaw = self.estimated_yaw
+        c, s = np.cos(yaw), np.sin(yaw)
         
-        try:
-            cov_inv = np.linalg.inv(cov_global)
-        except np.linalg.LinAlgError:
-            cov_inv = np.eye(2)
-            
-        diff_xy = self.particles[:, :2] - measurement[:2]
+        l2 = curr_long**2
+        t2 = curr_lat**2
         
-        # XYのマハラノビス距離^2
-        mahalanobis_sq_xy = np.einsum('ij,jk,ik->i', diff_xy, cov_inv, diff_xy)
+        a = c*c*l2 + s*s*t2
+        b = c*s*(l2 - t2)
+        d = s*s*l2 + c*c*t2
         
-        # --- 2. Z方向(高さ)の距離計算 ---
-        diff_z = self.particles[:, 2] - measurement[2]
+        det = a*d - b*b
+        
+        if abs(det) < 1e-6:
+             cov_inv = np.eye(2) * (1.0 / (self.std_stopped**2))
+        else:
+             inv_det = 1.0 / det
+             cov_inv = np.array([
+                 [d * inv_det, -b * inv_det],
+                 [-b * inv_det, a * inv_det]
+             ])
+             
+        return cov_inv
+
+    def update(self, detections):
+        if not detections: return
+
+        cov_inv = self._get_adaptive_covariance()
+
+        det_pos = np.array([d['pos'] for d in detections])           
+        det_sim = np.array([d.get('sim', 1.0) for d in detections])  
+
+        diff_xy = self.particles[:, np.newaxis, :2] - det_pos[np.newaxis, :, :2] 
+        mahal_sq = np.einsum('nmi,ij,nmj->nm', diff_xy, cov_inv, diff_xy)
+        
+        diff_z = self.particles[:, np.newaxis, 2] - det_pos[np.newaxis, :, 2]
         z_sq = (diff_z / self.std_z) ** 2
         
-        # --- 3. 空間尤度の統合 ---
-        spatial_likelihood = np.exp(-0.5 * (mahalanobis_sq_xy + z_sq))
-
-        # --- 4. 混合モデルによるReID統合 ---
-        uniform_weight = 1.0 / (self.num_particles * 100.0)
-        total_likelihood = (reid_sim * spatial_likelihood) + ((1.0 - reid_sim) * uniform_weight)
+        spatial_likelihoods = np.exp(-0.5 * (mahal_sq + z_sq))
         
-        self.weights *= total_likelihood
+        uniform_weight = 1.0 / (self.num_particles * 100.0)
+        total_likelihoods = (det_sim[np.newaxis, :] * spatial_likelihoods) + \
+                            ((1.0 - det_sim[np.newaxis, :]) * uniform_weight)
+        
+        best_likelihoods = np.max(total_likelihoods, axis=1) 
+        
+        self.weights *= best_likelihoods
         self.weights += 1.e-300
         self.weights /= np.sum(self.weights)
         
         self.estimate()
         self.resample()
+        self._update_estimated_yaw()
 
     def estimate(self):
-        """ 重み付き平均で現在の状態(x)を推定する """
         self.x = np.average(self.particles, weights=self.weights, axis=0)
 
     def resample(self):
         n_eff = 1.0 / np.sum(self.weights**2)
         if n_eff < self.num_particles / 2.0:
-            indices = self.systematic_resample(self.weights)
+            N = self.num_particles
+            cumulative_sum = np.cumsum(self.weights)
+            cumulative_sum[-1] = 1.0 
+            step = 1.0 / N
+            r = np.random.uniform(0, step)
+            positions = (np.arange(N) * step) + r
+            indices = np.searchsorted(cumulative_sum, positions)
             self.particles[:] = self.particles[indices]
-            self.weights[:] = 1.0 / self.num_particles
+            self.weights[:] = 1.0 / N
 
-    def systematic_resample(self, weights):
-        N = len(weights)
-        positions = (np.arange(N) + np.random.random()) / N
-        indexes = np.zeros(N, 'i')
-        cumulative_sum = np.cumsum(weights)
-        i, j = 0, 0
-        while i < N:
-            if positions[i] < cumulative_sum[j]:
-                indexes[i] = j
-                i += 1
-            else:
-                j += 1
-        return indexes
-        
 # ==========================================
-# 2. Unscented Kalman Filter (Dummy Implementation for compatibility)
+# 2. Kalman Tracker
 # ==========================================
-def fx(x, dt):
-    F = np.eye(6, dtype=float)
-    F[0, 3] = dt
-    F[1, 4] = dt
-    F[2, 5] = dt
-    return np.dot(F, x)
-
-def hx(x):
-    return x[:3]
-
 class KalmanBoxTracker(object):
-    def __init__(self, initial_pos):
-        points = MerweScaledSigmaPoints(n=6, alpha=0.1, beta=2.0, kappa=-3) 
-        self.kf = UKF(dim_x=6, dim_z=3, dt=0.1, fx=fx, hx=hx, points=points)
-        self.kf.x[:3] = initial_pos
-        self.kf.x[3:] = 0
-        self.kf.P *= 1.0 
-        self.kf.P[3:, 3:] *= 10.0
-        sensor_noise_std = 0.5  
-        self.kf.R = np.diag([sensor_noise_std, sensor_noise_std, sensor_noise_std]) ** 2 
-        self.kf.Q = np.eye(6) * 0.05**2
-        self.kf.Q[3:, 3:] *= 2.0 
-        self.last_timestamp = None
-
-    def predict(self, current_time):
-        if self.last_timestamp is None:
-            dt = 0.1
-        else:
-            dt = current_time - self.last_timestamp
-        self.last_timestamp = current_time
-        self.kf.predict(dt=dt)
-        return self.kf.x[:3]
-
-    def update(self, measurement, reid_sim=1.0, target_yaw=0.0):
-        # UKFは簡易実装のため、ReID/Yawは無視
-        self.kf.update(measurement)
+    def __init__(self, initial_pos): 
+        self.pos = initial_pos
+        self.x = np.zeros(6)
+        self.x[:3] = initial_pos
+    def predict(self, current_time): return self.pos
+    def update(self, detections):
+        if not detections: return
+        dists = [np.linalg.norm(self.pos - d['pos']) for d in detections]
+        self.pos = detections[np.argmin(dists)]['pos']
 
 # ==========================================
-
+# Candidate Class
+# ==========================================
 class Candidate:
     def __init__(self, id, pos, size, orientation, initial_points, params):
         self.id = id
@@ -310,46 +291,58 @@ class Candidate:
         self.pred_pos = self.kf.predict(current_time)
         return self.pred_pos
 
-    def update_state(self, pos, size, orientation, sim=1.0):
-        # QuaternionからYaw角を計算
-        q = orientation
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        yaw = np.arctan2(siny_cosp, cosy_cosp)
+    def update_state(self, detections, sim_map={}):
+        valid_detections = []
+        for i, det in enumerate(detections):
+            d = det.copy()
+            d['sim'] = sim_map.get(i, 0.5) 
+            valid_detections.append(d)
 
-        # 拡張されたupdateメソッドを呼び出し
-        self.kf.update(pos, reid_sim=sim, target_yaw=yaw)
+        self.kf.update(valid_detections)
         
-        if self.algo == "PF":
+        if hasattr(self.kf, 'x'):
             self.pos = self.kf.x[:3]
         else:
-            self.pos = self.kf.kf.x[:3]
-        self.size = size
-        self.orientation = orientation
-        self.last_seen_time = time.time()
+            self.pos = self.kf.pos
+
+        if valid_detections:
+            dists = [np.linalg.norm(self.pos - d['pos']) for d in valid_detections]
+            best_idx = np.argmin(dists)
+            best_det = valid_detections[best_idx]
+            self.size = best_det['size']
+            
+            if hasattr(self.kf, 'estimated_yaw'):
+                yaw = self.kf.estimated_yaw
+                cy = math.cos(yaw * 0.5)
+                sy = math.sin(yaw * 0.5)
+                q = self.orientation
+                q.w, q.x, q.y, q.z = cy, 0.0, 0.0, sy
+                self.orientation = q
+            else:
+                self.orientation = best_det['ori']
+                
+            self.last_seen_time = time.time()
 
     def add_points(self, points):
         self.queue.append(points)
-
+    
     def get_feature_distribution(self):
-        if len(self.feature_gallery) == 0:
-            return None, None
+        if len(self.feature_gallery) == 0: return None, None
         gallery_tensor = torch.stack(list(self.feature_gallery))
         mean_feature = torch.mean(gallery_tensor, dim=0)
         mean_feature = F.normalize(mean_feature.unsqueeze(0), p=2, dim=1).squeeze(0)
-        std_feature = torch.std(gallery_tensor, dim=0)
-        return mean_feature, std_feature
-
+        return mean_feature, None
+    
     def update_feature_gallery(self, feature_tensor):
         self.feature_gallery.append(feature_tensor.detach().cpu())
 
+# ==========================================
+# ROS Node
+# ==========================================
 class PersonTrackerClickInitNode(Node):
     def __init__(self):
         super().__init__('person_tracker_click_init')
         
-        # ==========================================
-        # パラメータ宣言と取得
-        # ==========================================
         self.declare_parameters(
             namespace='',
             parameters=[
@@ -359,10 +352,10 @@ class PersonTrackerClickInitNode(Node):
                 ('tracking.pf_num_particles', 500),
                 ('tracking.pf_process_noise_pos', 0.05),
                 ('tracking.pf_process_noise_vel', 0.1),
-                # ↓ 新しいパラメータ (マハラノビス距離用)
-                ('tracking.pf_std_long', 0.6), # 進行方向の分散 (大きめ)
-                ('tracking.pf_std_lat', 0.2),  # 横方向の分散 (小さめ)
-
+                ('tracking.pf_std_stopped', 0.2), 
+                ('tracking.pf_std_long_max', 0.6),
+                ('tracking.pf_std_lat_max', 0.25),
+                ('tracking.pf_max_speed_ref', 1.5),
                 ('reid.weight_path', f'{HOME_DIR}/ReID3D/reidnet/log/ckpt_best.pth'),
                 ('reid.sim_thresh', 0.80),
                 ('reid.sequence_length', 30),
@@ -370,14 +363,12 @@ class PersonTrackerClickInitNode(Node):
                 ('reid.feature_dim', 1024),
                 ('reid.num_class', 222),
                 ('reid.verify_thresh', 0.4),
-
                 ('detection.pca_wall_thresh', 0.35),
                 ('detection.pca_ratio_thresh', 5.0),
                 ('detection.pca_radial_thresh', 0.04),
                 ('detection.min_points', 5),
                 ('detection.normalize_num_points', 256),
                 ('detection.robot_radius', 0.45),
-
                 ('target_selection.mode', 0),
                 ('target_selection.auto_x_min', 0.0),
                 ('target_selection.auto_x_max', 3.0),
@@ -386,7 +377,6 @@ class PersonTrackerClickInitNode(Node):
             ]
         )
 
-        # パラメータを辞書として保持
         self.params = {
             'tracking_algo': self.get_parameter('tracking.algo').value,
             'max_missing_time': self.get_parameter('tracking.max_missing_time').value,
@@ -394,10 +384,10 @@ class PersonTrackerClickInitNode(Node):
             'pf_num_particles': self.get_parameter('tracking.pf_num_particles').value,
             'pf_process_noise_pos': self.get_parameter('tracking.pf_process_noise_pos').value,
             'pf_process_noise_vel': self.get_parameter('tracking.pf_process_noise_vel').value,
-            # ↓ 新しいパラメータ
-            'pf_std_long': self.get_parameter('tracking.pf_std_long').value,
-            'pf_std_lat': self.get_parameter('tracking.pf_std_lat').value,
-            
+            'pf_std_stopped': self.get_parameter('tracking.pf_std_stopped').value,
+            'pf_std_long_max': self.get_parameter('tracking.pf_std_long_max').value,
+            'pf_std_lat_max': self.get_parameter('tracking.pf_std_lat_max').value,
+            'pf_max_speed_ref': self.get_parameter('tracking.pf_max_speed_ref').value,
             'reid_weight_path': self.get_parameter('reid.weight_path').value,
             'reid_sim_thresh': self.get_parameter('reid.sim_thresh').value,
             'sequence_length': self.get_parameter('reid.sequence_length').value,
@@ -405,14 +395,12 @@ class PersonTrackerClickInitNode(Node):
             'reid_feature_dim': self.get_parameter('reid.feature_dim').value,
             'reid_num_class': self.get_parameter('reid.num_class').value,
             'verify_thresh': self.get_parameter('reid.verify_thresh').value,
-
             'pca_wall_thresh': self.get_parameter('detection.pca_wall_thresh').value,
             'pca_ratio_thresh': self.get_parameter('detection.pca_ratio_thresh').value,
             'pca_radial_thresh': self.get_parameter('detection.pca_radial_thresh').value,
             'min_points': self.get_parameter('detection.min_points').value,
             'normalize_num_points': self.get_parameter('detection.normalize_num_points').value,
             'robot_radius': self.get_parameter('detection.robot_radius').value,
-
             'choose_target_from_rviz2': self.get_parameter('target_selection.mode').value,
             'auto_x_min': self.get_parameter('target_selection.auto_x_min').value,
             'auto_x_max': self.get_parameter('target_selection.auto_x_max').value,
@@ -420,18 +408,13 @@ class PersonTrackerClickInitNode(Node):
             'auto_y_max': self.get_parameter('target_selection.auto_y_max').value,
         }
         
-        self.get_logger().info(f"Tracking Algo: {self.params['tracking_algo']}")
-        self.get_logger().info(f"PF Std Long: {self.params['pf_std_long']}, Lat: {self.params['pf_std_lat']}")
-        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.set_num_threads(4)
         self.net = self._load_model()
         self.get_logger().info(f'Model Loaded on {self.device}')
 
-        self.USE_WEIGHTED_SCORE = True
-
-        qos_profile = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
-        self.sub_bbox = self.create_subscription(Detection3DArray, '/bbox', self.bbox_callback, qos_profile)
+        self.qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.sub_bbox = self.create_subscription(Detection3DArray, '/bbox', self.bbox_callback, self.qos)
         self.sub_goal = self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
         self.pub_markers = self.create_publisher(MarkerArray, 'reid3d/person_reid_markers', 10)
         self.pub_status = self.create_publisher(String, 'tracker/target_status', 10)
@@ -446,37 +429,23 @@ class PersonTrackerClickInitNode(Node):
         self.captured_frames_count = 0 
         self.candidates = {} 
         self.next_candidate_id = 0
-        
         self.reid_thread = None
+        
+        # リカバリー用の非同期スレッド
+        self.recovery_thread = None
         self.is_reid_running = False
+        self.is_recovery_running = False
         self.reid_lock = threading.Lock()
-
-        self.process_executor = ProcessPoolExecutor(max_workers=4)
-
-        if self.params['choose_target_from_rviz2'] == 1:
-            self.get_logger().info(">>> Waiting for Click... Use '2D Goal Pose' in RViz.")
-        else:
-            self.get_logger().info(f">>> Auto Mode: Searching for target in front...")
-            
+        
         self.execution_count = 0
 
     def destroy_node(self):
-        self.process_executor.shutdown()
         super().destroy_node()
 
     def _load_model(self):
         try:
-            feature_dim = self.params['reid_feature_dim']
-            num_class = self.params['reid_num_class']
-            weight_path = self.params['reid_weight_path']
-
-            net = network.reid3d(feature_dim, num_class=num_class, stride=1)
-            
-            if not os.path.exists(weight_path):
-                self.get_logger().error(f"Weight path does not exist: {weight_path}")
-                sys.exit(1)
-            
-            state_dict = torch.load(weight_path, map_location=self.device)
+            net = network.reid3d(self.params['reid_feature_dim'], num_class=self.params['reid_num_class'], stride=1)
+            state_dict = torch.load(self.params['reid_weight_path'], map_location=self.device)
             from collections import OrderedDict
             new_state_dict = OrderedDict()
             for k, v in state_dict.items():
@@ -490,44 +459,40 @@ class PersonTrackerClickInitNode(Node):
             self.get_logger().error(f"Failed to load model: {e}")
             sys.exit(1)
 
-    def extract_feature_single(self, points_sequence):
-        if len(points_sequence) < 1: 
-            return None
-        input_seq = list(points_sequence)
-        seq_len = self.params['sequence_length']
-        
-        while len(input_seq) < seq_len:
-            input_seq.append(input_seq[-1])
-        if len(input_seq) > seq_len:
-            input_seq = input_seq[-seq_len:]
-        seq_np = np.array(input_seq)
-        
-        tensor = torch.from_numpy(seq_np).float()
-        input_tensor = tensor.unsqueeze(0).to(self.device)
-        
+    def extract_features_batch(self, points_seq_list):
+        if not points_seq_list: return None
+        processed_seqs = []
+        seq_len = self.params['sequence_length'] 
+        for seq in points_seq_list:
+            inp = list(seq)
+            while len(inp) < seq_len: inp.append(inp[-1])
+            if len(inp) > seq_len: inp = inp[-seq_len:]
+            processed_seqs.append(np.array(inp))
+        batch_np = np.array(processed_seqs)
+        tensor = torch.from_numpy(batch_np).float()
+        input_tensor = tensor.to(self.device)
         with torch.no_grad():
             output = self.net(input_tensor)
-            feature = output['val_bn'][0]
-            feature = feature.float()
-            feature = F.normalize(feature.unsqueeze(0), p=2, dim=1).squeeze(0)
-        return feature
-
+            features = output['val_bn']
+            features = F.normalize(features.float(), p=2, dim=1)
+        return features
+        
+    def extract_feature_single(self, points_sequence):
+        feats = self.extract_features_batch([points_sequence])
+        return feats[0] if feats is not None else None
+    
     def async_reid_worker(self, target_cand, points_seq, mode="UPDATE"):
+        """ ギャラリー更新用の非同期ワーカー """
         try:
             feature = self.extract_feature_single(points_seq)
-            if feature is None:
-                return
-
+            if feature is None: return
             with self.reid_lock:
                 feat_cpu = feature.cpu()
-                
                 if mode == "INIT":
                     self.registered_feature = feat_cpu
                     target_cand.update_feature_gallery(feat_cpu)
                     self.feature_locked = True
                     self.state = "TRACKING"
-                    self.get_logger().info(">>> [Async] Init Complete! Feature LOCKED.")
-
                 elif mode == "UPDATE":
                     if self.target_candidate and self.target_candidate.id == target_cand.id:
                         mean_feat, _ = target_cand.get_feature_distribution()
@@ -536,426 +501,363 @@ class PersonTrackerClickInitNode(Node):
                              sim = torch.dot(feature, self.registered_feature.to(self.device)).item()
                         elif mean_feat is not None:
                              sim = torch.dot(feature, mean_feat.to(self.device)).item()
-                        
                         target_cand.last_sim = sim
+                        if sim > 0.6: target_cand.update_feature_gallery(feat_cpu)
+        except Exception as e: self.get_logger().error(f"ReID Err: {e}")
+        finally: self.is_reid_running = False
 
-                        verify_thresh = self.params['verify_thresh']
+    def async_recovery_worker(self, snapshot_candidates):
+        """ LOST時のリカバリー用非同期ワーカー (3人ずつミニバッチ) """
+        try:
+            BATCH_SIZE = 3 # 3人ずつ処理してメモリ溢れを防ぐ
+            reg_feat = self.registered_feature.to(self.device)
+            if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
 
-                        if sim < verify_thresh:
-                            self.get_logger().warn(f"Low Similarity Detected! Sim: {sim:.2f} < {verify_thresh}")
+            found_match = False
+            best_match_info = None
 
-                        if sim > 0.6: 
-                            target_cand.update_feature_gallery(feat_cpu)
+            # ミニバッチループ
+            for i in range(0, len(snapshot_candidates), BATCH_SIZE):
+                batch_cands = snapshot_candidates[i : i + BATCH_SIZE]
+                batch_input = [c['queue'] for c in batch_cands]
+                
+                # 推論実行 (重い処理)
+                features = self.extract_features_batch(batch_input)
+                
+                if features is not None:
+                    sim_scores = torch.mm(features, reg_feat.T).squeeze(1).cpu().numpy()
+                    if sim_scores.ndim == 0: sim_scores = [sim_scores]
+                    
+                    best_idx_local = np.argmax(sim_scores)
+                    best_sim = float(sim_scores[best_idx_local])
+                    
+                    if best_sim > self.params['reid_sim_thresh']:
+                        # マッチしたらその候補情報を保存してループを抜ける
+                        found_match = True
+                        best_match_info = (batch_cands[best_idx_local]['id'], best_sim)
+                        break
+            
+            # メインスレッドの状態を更新
+            if found_match and best_match_info:
+                cid, sim = best_match_info
+                # 候補が存在するか再確認 (非同期中に消えている可能性があるため)
+                if cid in self.candidates:
+                    cand = self.candidates[cid]
+                    self.get_logger().info(f">>> RECOVERY SUCCEEDED! New ID:{cid} (Sim: {sim:.2f})")
+                    
+                    old_gallery = self.target_candidate.feature_gallery if self.target_candidate else None
+                    self.target_candidate = cand
+                    self.target_candidate.last_sim = sim
+                    if old_gallery:
+                        self.target_candidate.feature_gallery = old_gallery
+                    self.state = "TRACKING"
 
         except Exception as e:
-            self.get_logger().error(f"Async ReID Error: {e}")
+            self.get_logger().error(f"Recovery Err: {e}")
         finally:
-            self.is_reid_running = False
+            self.is_recovery_running = False
 
     def goal_callback(self, msg: PoseStamped):
-        if self.params['choose_target_from_rviz2'] == 0:
-            self.get_logger().warn(">>> Ignore Click: In 'Front Auto' mode (target_selection.mode=0).")
-            return
-
-        click_x = msg.pose.position.x
-        click_y = msg.pose.position.y
-        self.get_logger().info(f">>> Click Received at ({click_x:.2f}, {click_y:.2f})")
-        
-        closest_cand = None
-        min_dist = 3.0
-        
+        if self.params['choose_target_from_rviz2'] == 0: return
+        click_x, click_y = msg.pose.position.x, msg.pose.position.y
+        closest_cand, min_dist = None, 3.0
         for cid, cand in self.candidates.items():
             dist = math.sqrt((cand.pos[0] - click_x)**2 + (cand.pos[1] - click_y)**2)
-            if dist < min_dist:
-                min_dist = dist
-                closest_cand = cand
-        
+            if dist < min_dist: min_dist, closest_cand = dist, cand
         if closest_cand:
             self.target_candidate = closest_cand
             self.captured_frames_count = len(closest_cand.queue)
             self.feature_locked = False
             self.registered_feature = None
             self.state = "INITIALIZING"
-            self.get_logger().info(f">>> Target Selected: ID {closest_cand.id}. Gathering frames...")
-        else:
-            self.get_logger().warn(">>> No candidate found near click position!")
 
     def bbox_callback(self, msg: Detection3DArray):
         current_time = time.time()
-
         detections = []
-        
-        process_args = [(det, self.params) for det in msg.detections]
-        
-        if process_args:
-            results = self.process_executor.map(preprocess_detection_worker, process_args)
-            for res in results:
-                if res is not None:
-                    detections.append(res)
+        for det in msg.detections:
+            res = preprocess_detection(det, self.params)
+            if res is not None: detections.append(res)
         
         self.update_candidates(detections, current_time)
 
         if self.state == "WAIT_FOR_CLICK":
-            if self.params['choose_target_from_rviz2'] == 0:
-                self.process_auto_front_selection()
-            else:
-                self.pub_status.publish(String(data="WAITING FOR CLICK..."))
-
+            if self.params['choose_target_from_rviz2'] == 0: self.process_auto_front_selection()
+            else: self.pub_status.publish(String(data="WAITING FOR CLICK..."))
         elif self.state == "INITIALIZING":
-            self.process_initialization_async() 
-                
+            self.process_initialization_async()
         elif self.state == "TRACKING" or self.state == "LOST":
             self.process_autonomous_tracking()
-            
             if self.state == "TRACKING" and self.target_candidate:
-                time_since_last_seen = current_time - self.target_candidate.last_seen_time
-                
-                if time_since_last_seen < 0.2:
-                    pose_msg = PoseStamped()
-                    pose_msg.header = msg.header 
-                    pose_msg.pose.position.x = float(self.target_candidate.pos[0])
-                    pose_msg.pose.position.y = float(self.target_candidate.pos[1])
-                    pose_msg.pose.position.z = float(self.target_candidate.pos[2])
-                    pose_msg.pose.orientation = self.target_candidate.orientation
-                    self.pub_target_pose.publish(pose_msg)
+                pose_msg = PoseStamped()
+                pose_msg.header = msg.header
+                pose_msg.pose.position.x = float(self.target_candidate.pos[0])
+                pose_msg.pose.position.y = float(self.target_candidate.pos[1])
+                pose_msg.pose.position.z = float(self.target_candidate.pos[2])
+                pose_msg.pose.orientation = self.target_candidate.orientation
+                self.pub_target_pose.publish(pose_msg)
         
         self.publish_visualization(msg.header)
-        self.publish_status_marker_3d(msg.header)        
+        self.publish_status_marker_3d(msg.header)
 
     def process_auto_front_selection(self):
-        min_dist = 100.0
-        best_cand = None
-
-        x_min = self.params['auto_x_min']
-        x_max = self.params['auto_x_max']
-        y_min = self.params['auto_y_min']
-        y_max = self.params['auto_y_max']
-
+        min_dist, best_cand = 100.0, None
+        x_min, x_max = self.params['auto_x_min'], self.params['auto_x_max']
+        y_min, y_max = self.params['auto_y_min'], self.params['auto_y_max']
         for cid, cand in self.candidates.items():
-            x = cand.pos[0]
-            y = cand.pos[1]
-            
-            if x_min < x < x_max and y_min < y < y_max:
-                dist_to_robot = x
-                if dist_to_robot < min_dist:
-                    min_dist = dist_to_robot
-                    best_cand = cand
-        
+            if x_min < cand.pos[0] < x_max and y_min < cand.pos[1] < y_max:
+                if cand.pos[0] < min_dist: min_dist, best_cand = cand.pos[0], cand
         if best_cand:
             self.target_candidate = best_cand
             self.captured_frames_count = len(best_cand.queue)
             self.feature_locked = False
             self.registered_feature = None
             self.state = "INITIALIZING"
-            self.get_logger().info(f">>> [Auto] Target Selected Front: ID {best_cand.id} at ({best_cand.pos[0]:.2f}, {best_cand.pos[1]:.2f})")
-        else:
-             self.pub_status.publish(String(data="SEARCHING FRONT..."))
+        else: self.pub_status.publish(String(data="SEARCHING FRONT..."))
 
     def update_candidates(self, detections, current_time):
-        matched_det_indices = set()
-        active_ids = set()
-        for cid, cand in self.candidates.items():
+        # 1. 状態予測
+        for cand in self.candidates.values():
             cand.predict(current_time)
         
-        for cid, cand in self.candidates.items():
-            best_dist = self.params['match_dist_thresh']
-            best_idx = -1
+        active_ids = set()
+        
+        if not self.candidates or not detections:
             for i, det in enumerate(detections):
-                if i in matched_det_indices: continue
-                dist = np.linalg.norm(det['pos'] - cand.pred_pos)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_idx = i
-            if best_idx != -1:
-                det = detections[best_idx]
-                
-                # --- ここでReIDスコアも更新に使用する ---
-                # last_sim が 0 (初期状態) の場合は 1.0 (信頼) と仮定
-                current_sim = cand.last_sim if cand.last_sim > 0.0 else 1.0
-                cand.update_state(det['pos'], det['size'], det['ori'], sim=current_sim)
-                
-                cand.add_points(det['points'])
-                matched_det_indices.add(best_idx)
-                active_ids.add(cid)
-            elif (current_time - cand.last_seen_time) < self.params['max_missing_time']:
+                if not self.candidates: self._create_new_candidate(det)
+            if not detections:
+                for cid, cand in self.candidates.items():
+                    if (current_time - cand.last_seen_time) < self.params['max_missing_time']:
+                        active_ids.add(cid)
+                self.candidates = {k: v for k, v in self.candidates.items() if k in active_ids}
+            return
+
+        # 2. 距離計算とペアリング
+        cand_ids = list(self.candidates.keys())
+        cost_matrix = []
+        for cid in cand_ids:
+            cand = self.candidates[cid]
+            costs = [np.linalg.norm(cand.pred_pos - det['pos']) for det in detections]
+            cost_matrix.append(costs)
+        
+        pairs = []
+        for r in range(len(cand_ids)):
+            for c in range(len(detections)):
+                pairs.append((cost_matrix[r][c], r, c))
+        pairs.sort(key=lambda x: x[0])
+        
+        used_cand_indices = set()
+        used_det_indices = set()
+        match_dist = self.params['match_dist_thresh']
+        
+        # --- ペアリングと更新 (Adaptive ReID: Target & Neighbors) ---
+        reid_needed_pairs = [] # (dist, r, c, cid, det)
+        
+        target_pos = None
+        if self.target_candidate:
+            target_pos = self.target_candidate.pos
+
+        for dist, r, c in pairs:
+            if r in used_cand_indices or c in used_det_indices: continue
+            if dist > match_dist: continue
+            
+            cid = cand_ids[r]
+            cand = self.candidates[cid]
+            is_target = (self.target_candidate and self.target_candidate.id == cid)
+            
+            # ★周辺チェック: ターゲットに近い候補もReID計算対象にする
+            is_neighbor = False
+            if target_pos is not None and not is_target:
+                dist_to_target = np.linalg.norm(cand.pos - target_pos)
+                if dist_to_target < 2.0: # 2m以内なら類似度を計算して表示
+                    is_neighbor = True
+
+            should_run_reid = (is_target or is_neighbor) and (self.registered_feature is not None)
+            
+            if should_run_reid:
+                # ターゲット本人の場合、距離が非常に近ければスキップ(最適化)
+                if is_target and dist < 0.8:
+                    used_cand_indices.add(r)
+                    used_det_indices.add(c)
+                    cand.update_state([detections[c]], sim_map={0: cand.last_sim}) 
+                    cand.add_points(detections[c]['points'])
+                    active_ids.add(cid)
+                else:
+                    # ターゲットが少し離れている、または周辺人物の場合 -> ReID実行
+                    reid_needed_pairs.append((r, c, cid, detections[c]))
+                    used_cand_indices.add(r)
+                    used_det_indices.add(c)
+            else:
+                # ターゲットから遠い他人 -> ReID不要
+                used_cand_indices.add(r)
+                used_det_indices.add(c)
+                cand.update_state([detections[c]], sim_map={0: 1.0})
+                cand.add_points(detections[c]['points'])
                 active_ids.add(cid)
 
-        for i, det in enumerate(detections):
-            if i not in matched_det_indices:
-                nid = self.next_candidate_id
-                self.next_candidate_id += 1
-                self.candidates[nid] = Candidate(nid, det['pos'], det['size'], det['ori'], det['points'], self.params)
-                active_ids.add(nid)
-        self.candidates = {k: v for k, v in self.candidates.items() if k in active_ids}
+        # ReID一括実行 (Batch)
+        if reid_needed_pairs:
+            batch_input = [[p[3]['points']] * self.params['sequence_length'] for p in reid_needed_pairs]
+            features = self.extract_features_batch(batch_input)
+            
+            if features is not None:
+                reg_feat = self.registered_feature.to(self.device)
+                if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
+                
+                sim_scores = torch.mm(features, reg_feat.T).squeeze(1).cpu().numpy()
+                
+                # スコアが1つの場合スカラーになるので配列化
+                if sim_scores.ndim == 0: sim_scores = [sim_scores]
+
+                for i, (r, c, cid, det) in enumerate(reid_needed_pairs):
+                    score = float(sim_scores[i])
+                    cand = self.candidates[cid]
+                    cand.last_sim = score
+                    cand.update_state([det], sim_map={0: score})
+                    cand.add_points(det['points'])
+                    active_ids.add(cid)
+            else:
+                for r, c, cid, det in reid_needed_pairs:
+                    cand = self.candidates[cid]
+                    cand.update_state([det], sim_map={0: 0.5})
+                    cand.add_points(det['points'])
+                    active_ids.add(cid)
+
+        # 5. 未割り当て処理
+        for r, cid in enumerate(cand_ids):
+            if r not in used_cand_indices:
+                cand = self.candidates[cid]
+                if (current_time - cand.last_seen_time) < self.params['max_missing_time']:
+                    active_ids.add(cid)
+        
+        for c in range(len(detections)):
+            if c not in used_det_indices:
+                self._create_new_candidate(detections[c])
+        
+        keys_to_remove = []
+        for cid, cand in self.candidates.items():
+            if (current_time - cand.last_seen_time) >= self.params['max_missing_time']:
+                keys_to_remove.append(cid)
+        for cid in keys_to_remove:
+            del self.candidates[cid]
+
+    def _create_new_candidate(self, det):
+        nid = self.next_candidate_id
+        self.next_candidate_id += 1
+        self.candidates[nid] = Candidate(nid, det['pos'], det['size'], det['ori'], det['points'], self.params)
 
     def process_initialization_async(self):
         seq_len = self.params['sequence_length']
         if not (self.target_candidate and self.target_candidate.id in self.candidates):
              self.pub_status.publish(String(data="Target Lost during Init"))
-             if self.params['choose_target_from_rviz2'] == 0:
-                 self.state = "WAIT_FOR_CLICK"
+             if self.params['choose_target_from_rviz2'] == 0: self.state = "WAIT_FOR_CLICK"
              return
-
         self.target_candidate = self.candidates[self.target_candidate.id]
         self.captured_frames_count = len(self.target_candidate.queue)
-        
         status_msg = f"INITIALIZING: {self.captured_frames_count}/{seq_len}"
-        
         if self.captured_frames_count >= seq_len and not self.is_reid_running:
             status_msg += " [Processing...]"
             self.is_reid_running = True
             seq_copy = list(self.target_candidate.queue)
-            self.reid_thread = threading.Thread(
-                target=self.async_reid_worker,
-                args=(self.target_candidate, seq_copy, "INIT")
-            )
+            self.reid_thread = threading.Thread(target=self.async_reid_worker, args=(self.target_candidate, seq_copy, "INIT"))
             self.reid_thread.start()
-            
         self.pub_status.publish(String(data=status_msg))
 
     def process_autonomous_tracking(self):
         target_found = False
         
+        # 1. ターゲット追跡チェック
         if self.target_candidate and self.target_candidate.id in self.candidates:
             self.target_candidate = self.candidates[self.target_candidate.id]
             target_found = True
             
+            # 定期的な特徴更新
             self.execution_count += 1
-            if (self.execution_count % 5 == 0) and not self.is_reid_running:
-                
-                is_crowded = False
-                for cid, cand in self.candidates.items():
-                    if cid == self.target_candidate.id: continue
-                    dist = np.linalg.norm(cand.pos - self.target_candidate.pos)
-                    if dist < 1.5:
-                        is_crowded = True
-                        break
-                
-                if not is_crowded and len(self.target_candidate.queue) >= 1:
+            if (self.execution_count % 10 == 0) and not self.is_reid_running:
+                if len(self.target_candidate.queue) >= 1:
                     self.is_reid_running = True
                     seq_copy = list(self.target_candidate.queue)
-                    self.reid_thread = threading.Thread(
-                        target=self.async_reid_worker,
-                        args=(self.target_candidate, seq_copy, "UPDATE")
-                    )
+                    self.reid_thread = threading.Thread(target=self.async_reid_worker, args=(self.target_candidate, seq_copy, "UPDATE"))
                     self.reid_thread.start()
 
-        if not target_found:
+        if target_found:
+            self.pub_status.publish(String(data=f"TRACKING ID:{self.target_candidate.id}"))
+            self.state = "TRACKING" 
+        else:
             self.state = "LOST"
             self.pub_status.publish(String(data="LOST - Searching..."))
-            
-            best_sim = -1.0
-            best_cand = None
-            
-            target_mean = None
-            if self.target_candidate:
-                target_mean, _ = self.target_candidate.get_feature_distribution()
-            if target_mean is None:
-                target_mean = self.registered_feature.cpu()
-            
-            target_gallery_len = len(self.target_candidate.feature_gallery) if self.target_candidate else 0
-            seq_len = self.params['sequence_length']
 
-            for cid, cand in self.candidates.items():
-                if len(cand.queue) < 5: continue 
+            # ★修正: リカバリー処理を非同期スレッドへ (高速化 & 並列化)
+            if self.registered_feature is not None and not self.is_recovery_running:
                 
-                search_seq = list(cand.queue)
-                while len(search_seq) < seq_len: search_seq.append(search_seq[-1])
+                # スナップショットを作成してスレッドに渡す
+                snapshot_candidates = []
+                for cid, cand in self.candidates.items():
+                    if len(cand.queue) >= 3: 
+                        snapshot_candidates.append({'id': cid, 'queue': list(cand.queue)})
                 
-                feat = self.extract_feature_single(search_seq[:seq_len])
-                if feat is None: continue
-                feat = feat.cpu()
-                
-                sim = 0.0
-                if target_gallery_len < 10:
-                    sim = torch.dot(feat, self.registered_feature.cpu()).item()
-                elif self.registered_feature is not None and target_mean is not None:
-                    if self.USE_WEIGHTED_SCORE:
-                        sim_gallery = torch.dot(feat, target_mean).item()
-                        sim_base = torch.dot(feat, self.registered_feature.cpu()).item()
-                        sim = (sim_base * 0.3) + (sim_gallery * 0.7)
-                    else:
-                        sim = torch.dot(feat, target_mean).item()
-                else:
-                    sim = torch.dot(feat, target_mean).item()
-
-                cand.last_sim = sim 
-                if sim > self.params['reid_sim_thresh'] and sim > best_sim:
-                    best_sim = sim
-                    best_cand = cand
-            
-            if best_cand:
-                self.get_logger().info(f"ReID RECOVERY! New ID:{best_cand.id} Sim:{best_sim:.2f}")
-                if self.target_candidate:
-                    old_gallery = self.target_candidate.feature_gallery
-                    self.target_candidate = best_cand
-                    self.target_candidate.feature_gallery = old_gallery
-                else:
-                    self.target_candidate = best_cand
-                self.target_candidate.last_sim = best_sim
-                self.state = "TRACKING"
-        else:
-            self.pub_status.publish(String(data=f"TRACKING ID:{self.target_candidate.id}"))
+                if snapshot_candidates:
+                    self.is_recovery_running = True
+                    self.recovery_thread = threading.Thread(target=self.async_recovery_worker, args=(snapshot_candidates,))
+                    self.recovery_thread.start()
 
     def publish_status_marker_3d(self, header):
         marker = Marker()
-        
-        if not header.frame_id:
-            header.frame_id = "livox_frame"
-            
-        marker.header = header 
-        marker.ns = "status_3d"
-        marker.id = 0
-        marker.type = Marker.TEXT_VIEW_FACING
-        marker.action = Marker.ADD
+        if not header.frame_id: header.frame_id = "livox_frame"
+        marker.header = header; marker.ns = "status_3d"; marker.id = 0; marker.type = Marker.TEXT_VIEW_FACING; marker.action = Marker.ADD
         marker.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
-        
-        marker.pose.position.x = 1.0 
-        marker.pose.position.y = 0.0
-        marker.pose.position.z = 1.5
-        marker.pose.orientation.w = 1.0
-        marker.scale.z = 0.5 
-
-        seq_len = self.params['sequence_length']
-
-        if self.state == "INITIALIZING":
-            marker.text = f"INITIALIZING ({self.captured_frames_count}/{seq_len})"
-            marker.color = ColorRGBA(r=0.3, g=0.3, b=1.0, a=1.0) 
-        elif self.state == "TRACKING":
-            tid = self.target_candidate.id if self.target_candidate else "?"
-            sim = self.target_candidate.last_sim if self.target_candidate else 0.0
-            marker.text = f"TRACKING ID:{tid}\nSim:{sim:.2f}"
-            marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0) 
-        elif self.state == "LOST":
-            marker.text = "LOST - SEARCHING..."
-            marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0) 
-        else:
-            if self.params['choose_target_from_rviz2'] == 1:
-                marker.text = "WAITING FOR CLICK"
-            else:
-                marker.text = "SEARCHING FRONT..."
-            marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0) 
-
+        marker.pose.position.x = 1.0; marker.pose.position.y = 0.0; marker.pose.position.z = 1.5; marker.pose.orientation.w = 1.0; marker.scale.z = 0.5 
+        if self.state == "INITIALIZING": marker.text, marker.color = f"INITIALIZING", ColorRGBA(r=0.3, g=0.3, b=1.0, a=1.0)
+        elif self.state == "TRACKING": marker.text, marker.color = f"TRACKING", ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+        elif self.state == "LOST": marker.text, marker.color = "LOST", ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+        else: marker.text, marker.color = "WAITING", ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
         self.pub_status_marker.publish(marker)
 
     def publish_visualization(self, header):
         marker_array = MarkerArray()
-        seq_len = self.params['sequence_length']
-        
-        target_id = -1
-        
-        if self.target_candidate:
-            target_id = self.target_candidate.id
-        
+        target_id = self.target_candidate.id if self.target_candidate else -1
         all_particles_xyz = []    
-        
         for cid, cand in self.candidates.items():
             is_target = (target_id != -1 and cid == target_id)
             mk = Marker()
-            mk.header = header
-            mk.ns = "candidates"
-            mk.id = cid
-            mk.action = Marker.ADD
-            mk.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
+            mk.header = header; mk.ns = "candidates"; mk.id = cid; mk.action = Marker.ADD; mk.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
             mk.pose.position.x, mk.pose.position.y, mk.pose.position.z = cand.pos
-            q = cand.orientation
-            norm = math.sqrt(q.x**2 + q.y**2 + q.z**2 + q.w**2)
-            if norm < 1e-6:
-                mk.pose.orientation.w = 1.0
-            else:
-                mk.pose.orientation.x = q.x / norm
-                mk.pose.orientation.y = q.y / norm
-                mk.pose.orientation.z = q.z / norm
-                mk.pose.orientation.w = q.w / norm
-            if is_target:
-                mk.type = Marker.CUBE
-                mk.scale.x = max(cand.size[0], 0.2)
-                mk.scale.y = max(cand.size[1], 0.2)
-                mk.scale.z = max(cand.size[2], 0.2)
-                if self.feature_locked:
-                    mk.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.5)
-                else:
-                    mk.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.5)
-            else:
-                mk.type = Marker.SPHERE
-                mk.scale.x = mk.scale.y = mk.scale.z = 0.5
-                mk.color = ColorRGBA(r=0.7, g=0.7, b=0.7, a=0.3) 
+            mk.pose.orientation = cand.orientation
+            if is_target: mk.type, mk.scale.x, mk.scale.y, mk.scale.z, mk.color = Marker.CUBE, max(cand.size[0], 0.2), max(cand.size[1], 0.2), max(cand.size[2], 0.2), ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.5)
+            else: mk.type, mk.scale.x, mk.scale.y, mk.scale.z, mk.color = Marker.SPHERE, 0.5, 0.5, 0.5, ColorRGBA(r=0.7, g=0.7, b=0.7, a=0.3)
             marker_array.markers.append(mk)
+            if cand.algo == 'PF' and hasattr(cand.kf, 'particles') and is_target:
+                all_particles_xyz.append(cand.kf.particles[:, :3])
             
-            # ==========================================
-            # パーティクル収集
-            # ==========================================
-            if cand.algo == 'PF' and hasattr(cand.kf, 'particles'):
-                if is_target:
-                    xyz = cand.kf.particles[:, :3]
-                    all_particles_xyz.append(xyz)
-            # ==========================================
+            # --- Text Marker (ID & Sim) ---
+            text = Marker(); text.header = header; text.ns = "text"; text.id = cid; text.type = Marker.TEXT_VIEW_FACING; text.action = Marker.ADD
+            text.pose.position.x, text.pose.position.y, text.pose.position.z = cand.pos[0], cand.pos[1], cand.pos[2]+1.0
+            text.scale.z = 0.3; text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0); text.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
             
-            text = Marker()
-            text.header = header
-            text.ns = "text"
-            text.id = cid
-            text.type = Marker.TEXT_VIEW_FACING
-            text.action = Marker.ADD
-            text.pose.position.x = cand.pos[0]
-            text.pose.position.y = cand.pos[1]
-            text.pose.position.z = cand.pos[2] + (cand.size[2] if is_target else 0.5) + 0.5
-            text.pose.orientation.w = 1.0
-            text.scale.z = 0.3
-            if is_target:
-                text.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-            else:
-                text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
             label = f"ID:{cid}"
-            if cand.last_sim > 0: 
+            if cand.last_sim > 0.001:
                 label += f"\nSim:{cand.last_sim:.2f}"
-            elif is_target and self.feature_locked:
-                label += "\nSim:Calc..."
-            if is_target and not self.feature_locked: 
-                label += f"\nInit:{self.captured_frames_count}/{seq_len}"
-            
-            label += f"\n[{cand.algo}]"
+            if is_target:
+                label += "\n[TARGET]"
+                text.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0) # ターゲットは緑文字
             
             text.text = label
-            text.lifetime = rclpy.duration.Duration(seconds=0.2).to_msg()
             marker_array.markers.append(text)
             
         self.pub_markers.publish(marker_array)
-        
         if len(all_particles_xyz) > 0:
             points_np = np.vstack(all_particles_xyz)
-            
-            # --- 赤色データの作成 ---
-            red_color_int = 0xFF0000
-            red_color_float = np.array([red_color_int], dtype=np.uint32).view(np.float32)[0]
-
-            # NumPy構造化配列 (x, y, z, rgb)
-            data = np.zeros(len(points_np), dtype=[
-                ('x', np.float32),
-                ('y', np.float32),
-                ('z', np.float32),
-                ('rgb', np.float32)
-            ])
-            data['x'] = points_np[:, 0]
-            data['y'] = points_np[:, 1]
-            data['z'] = points_np[:, 2]
-            data['rgb'] = red_color_float
-
-            msg = rnp.msgify(PointCloud2, data)
-            msg.header = header
-            
+            red_color_float = np.array([0xFF0000], dtype=np.uint32).view(np.float32)[0]
+            data = np.zeros(len(points_np), dtype=[('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.float32)])
+            data['x'], data['y'], data['z'], data['rgb'] = points_np[:, 0], points_np[:, 1], points_np[:, 2], red_color_float
+            msg = rnp.msgify(PointCloud2, data); msg.header = header
             self.pub_particles.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)
     node = PersonTrackerClickInitNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    try: rclpy.spin(node)
+    except KeyboardInterrupt: pass
+    finally: node.destroy_node(); rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

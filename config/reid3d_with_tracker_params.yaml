@@ -5,7 +5,7 @@ harrp:
         algo: "PF"                     # "PF" (Particle Filter) or "UKF" (Unscented Kalman Filter)
         max_missing_time: 1.0          # 追跡対象が見えなくなってからロストとみなすまでの時間 [s]
         match_dist_thresh: 1.0         # フレーム間の同一人物判定の距離閾値 [m]
-        pf_num_particles: 500          # パーティクルフィルタの粒子数
+        pf_num_particles: 300          # パーティクルフィルタの粒子数
         pf_process_noise_pos: 0.05     # 位置のプロセスノイズ (初期粒子の拡散具合) [m]
         pf_process_noise_vel: 0.35     # 速度のプロセスノイズ (粒子の散らばり速度) [m/s]
         pf_std_long: 0.15              # 進行方向の分散
