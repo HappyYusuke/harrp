@@ -2,24 +2,24 @@ harrp:
   mpc_controller:
     ros__parameters:
       # --- 制約条件 ---
-      max_speed: 0.3        # 最高並進速度 [m/s]
+      max_speed: 0.8        # 最高並進速度 [m/s]
       min_speed: 0.0        # 最低並進速度 [m/s] (後退なし)
       max_yaw_rate: 0.5     # 最高旋回速度 [rad/s]
-      max_accel: 0.5        # 最大加速度 [m/s^2]
-      max_dyaw_rate: 1.0    # 最大角加速度 [rad/s^2]
+      max_accel: 1.0        # 最大加速度 [m/s^2]
+      max_dyaw_rate: 0.5    # 最大角加速度 [rad/s^2]
   
       # --- MPCパラメータ ---
       dt: 0.1               # 予測の刻み時間 [s]
       horizon: 10            # 予測ホライズン (何ステップ先まで読むか)
   
       # --- 重み付け (Cost Function) ---
-      w_dist: 0.5           # ゴールへの距離の重み
-      w_heading: 0.1        # ゴール方向への向きの重み
-      w_vel: 0.3            # 目標速度維持の重み
-      w_obs: 0.3            # 障害物回避の重み
+      w_dist: 0.3           # ゴールへの距離の重み
+      w_heading: 0.03        # ゴール方向への向きの重み
+      w_vel: 0.1            # 目標速度維持の重み
+      w_obs: 0.15            # 障害物回避の重み
   
       # --- ロボット設定 ---
-      robot_radius: 0.3     # ロボットの半径 (衝突判定用) [m]
+      robot_radius: 0.2     # ロボットの半径 (衝突判定用) [m]
       goal_tolerance: 0.8   # ゴールとみなす距離 [m] (この距離内で旋回モードへ移行)
       sensor_offset: 0.156    # ロボット中心から見たLiDARの前後位置補正 [m]
   

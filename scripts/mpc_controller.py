@@ -10,7 +10,7 @@ from visualization_msgs.msg import Marker
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
-import tf2_geometry_msgs 
+import tf2_geometry_msgs # これが必要です
 
 import numpy as np
 import math
@@ -79,13 +79,6 @@ def mpc_cost_jit(u_flat, current_state, target, obstacles,
         
         # --- 障害物回避コスト (ここが一番重い処理) ---
         if len(obstacles) > 0:
-            # 配列演算で一括計算 (Numbaならループでも速いが、Broadcastingも速い)
-            # 障害物との距離の最小値を求める
-            # dxs = obstacles[:, 0] - px
-            # dys = obstacles[:, 1] - py
-            # dists = np.sqrt(dxs**2 + dys**2)
-            # min_obs_dist = np.min(dists)
-            
             # Numba最適化ループ版 (メモリ確保を避けるため手動ループ)
             min_obs_dist = 10000.0
             for j in range(len(obstacles)):
@@ -116,12 +109,12 @@ class MPCConfig:
         self.max_dyaw_rate = 2.0
         
         # --- MPCパラメータ ---
-        self.dt = 0.2           
+        self.dt = 0.2            
         self.horizon = 8        
         
         # --- 重み付け ---
         self.w_dist = 1.0        
-        self.w_heading = 0.5    
+        self.w_heading = 0.5     
         self.w_vel = 1.5        
         self.w_obs = 0.8        
         
@@ -277,6 +270,7 @@ class MPCController(Node):
         self.is_tracker_lost = False
 
         try:
+            # 追跡中はodom座標系での位置を常に更新し続ける
             transform_timeout = rclpy.duration.Duration(seconds=0.05)
             self.target_odom = self.tf_buffer.transform(msg, 'odom', timeout=transform_timeout)
         except (LookupException, ConnectivityException, ExtrapolationException):
@@ -340,17 +334,18 @@ class MPCController(Node):
             if self.target_odom is None:
                 return None
             try:
-                # ★修正: タイムスタンプを最新にしてから変換 (ロボットが動いてもターゲット位置を固定するため)
-                current_target_in_odom = PoseStamped()
-                current_target_in_odom.header.frame_id = self.target_odom.header.frame_id
-                current_target_in_odom.header.stamp = rclpy.time.Time().to_msg()
-                current_target_in_odom.pose = self.target_odom.pose
-
-                target_recovered = self.tf_buffer.transform(
-                    current_target_in_odom, 
-                    'base_link', 
-                    timeout=rclpy.duration.Duration(seconds=0.1)
+                # ★修正: 明示的に最新の transform (odom -> base_link) を取得して適用する
+                # これにより、odom固定の座標(self.target_odom)を、現在のロボット位置から見た座標に変換できる
+                
+                trans = self.tf_buffer.lookup_transform(
+                    'base_link',  # Target Frame (現在のロボット座標系)
+                    'odom',       # Source Frame (固定座標系)
+                    rclpy.time.Time() # 最新のTransformを取得 (Time(0))
                 )
+                
+                # do_transform_pose を使って変換 (target_odom は PoseStamped)
+                target_recovered = tf2_geometry_msgs.do_transform_pose(self.target_odom, trans)
+                
                 return np.array([target_recovered.pose.position.x, target_recovered.pose.position.y])
 
             except (LookupException, ConnectivityException, ExtrapolationException) as e:
@@ -514,10 +509,9 @@ class MPCController(Node):
         
         is_lost = self.is_tracker_lost or (elapsed > self.config.lost_timeout)
 
-        if is_lost:
-            marker.header.frame_id = "base_link"
-        else:
-            marker.header.frame_id = self.sensor_frame_id
+        # ★修正: ターゲット座標(target)は常に base_link 基準で計算されている
+        # したがってマーカーのframe_idも常に base_link にする
+        marker.header.frame_id = "base_link"
 
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "mpc_target"

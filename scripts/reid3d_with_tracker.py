@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import math
 import threading
 import struct
+from numba import jit
 
 # --- Parallel Processing Imports ---
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +29,94 @@ from geometry_msgs.msg import PoseStamped, Point
 from sensor_msgs.msg import PointCloud2
 
 import ros2_numpy as rnp
+
+@jit(nopython=True, cache=True)
+def pf_predict_jit(particles, dt, process_noise_pos, process_noise_vel):
+    num = particles.shape[0]
+    # ノイズ生成
+    noise_pos = np.random.randn(num, 2) * process_noise_pos
+    noise_z = np.random.randn(num) * (process_noise_pos * 0.1)
+    noise_vel = np.random.randn(num, 2) * process_noise_vel
+    
+    # 状態遷移
+    particles[:, 0] += particles[:, 3] * dt + noise_pos[:, 0]
+    particles[:, 1] += particles[:, 4] * dt + noise_pos[:, 1]
+    particles[:, 2] += particles[:, 5] * dt + noise_z
+    particles[:, 3:5] += noise_vel
+    particles[:, 5] *= 0.5
+    return particles
+
+@jit(nopython=True, cache=True)
+def pf_update_jit(particles, weights, det_pos, det_sim, cov_inv, std_z, sim_thresh):
+    """
+    尤度計算と重み更新を高速計算
+    weightsを受け取って直接更新する方式に変更（高速化＆型エラー回避）
+    """
+    # 形状から整数として取得 (これで float エラーを回避)
+    N_particles = particles.shape[0]
+    N_dets = det_pos.shape[0]
+    
+    # 基準となる微小確率
+    epsilon = 1.0 / (N_particles * 100.0)
+    
+    # 共分散行列の要素 (2x2)
+    c00 = cov_inv[0, 0]
+    c01 = cov_inv[0, 1]
+    c10 = cov_inv[1, 0]
+    c11 = cov_inv[1, 1]
+    
+    std_z_sq = std_z ** 2
+
+    # 各パーティクルについて計算
+    for i in range(N_particles):
+        px = particles[i, 0]
+        py = particles[i, 1]
+        pz = particles[i, 2]
+        
+        best_likelihood = 0.0
+        
+        for j in range(N_dets):
+            sim = det_sim[j]
+            
+            # 【足切り】類似度が閾値未満なら計算スキップ
+            if sim < sim_thresh:
+                lik = epsilon
+            else:
+                dx = px - det_pos[j, 0]
+                dy = py - det_pos[j, 1]
+                dz = pz - det_pos[j, 2]
+                
+                # マハラノビス距離の2乗 (XY平面)
+                mahal_sq = (dx * c00 * dx) + (dx * c01 * dy) + (dy * c10 * dx) + (dy * c11 * dy)
+                
+                # Z軸の距離スコア
+                z_sq = (dz**2) / std_z_sq
+                
+                # 空間尤度
+                spatial_prob = np.exp(-0.5 * (mahal_sq + z_sq))
+                
+                # トータル尤度
+                lik = sim * spatial_prob
+                
+                if lik < epsilon:
+                    lik = epsilon
+
+            if lik > best_likelihood:
+                best_likelihood = lik
+        
+        # 重みの更新
+        weights[i] *= best_likelihood
+        weights[i] += 1.e-300
+
+    # 正規化
+    w_sum = np.sum(weights)
+    if w_sum > 0:
+        weights /= w_sum
+    else:
+        # 全滅した場合はリセット
+        weights[:] = 1.0 / N_particles
+
+    return weights
 
 # ============================
 # ReIDモデル設定
@@ -100,6 +189,8 @@ def preprocess_detection(detection, params):
 
     norm_points = normalize_point_cloud(raw_points, num_points=params['normalize_num_points'])
     bbox = detection.bbox
+    size = np.array([bbox.size.x, bbox.size.y, bbox.size.z])
+    
     pos = np.array([bbox.center.position.x, bbox.center.position.y, bbox.center.position.z])
     size = np.array([bbox.size.x, bbox.size.y, bbox.size.z])
     
@@ -152,14 +243,12 @@ class ParticleFilterTracker(object):
             dt = current_time - self.last_timestamp
         self.last_timestamp = current_time
         
-        self.particles[:, 0] += self.particles[:, 3] * dt
-        self.particles[:, 1] += self.particles[:, 4] * dt
-        self.particles[:, 2] += self.particles[:, 5] * dt
-        
-        self.particles[:, :2] += np.random.randn(self.num_particles, 2) * self.process_noise_pos
-        self.particles[:, 2]  += np.random.randn(self.num_particles) * (self.process_noise_pos * 0.1)
-        self.particles[:, 3:5] += np.random.randn(self.num_particles, 2) * self.process_noise_vel
-        self.particles[:, 5] *= 0.5 
+        self.particles = pf_predict_jit(
+            self.particles, 
+            dt, 
+            self.process_noise_pos, 
+            self.process_noise_vel
+        )
         
         self.estimate()
         self._update_estimated_yaw()
@@ -209,26 +298,26 @@ class ParticleFilterTracker(object):
 
         cov_inv = self._get_adaptive_covariance()
 
-        det_pos = np.array([d['pos'] for d in detections])           
-        det_sim = np.array([d.get('sim', 1.0) for d in detections])  
+        # NumPy配列の準備 (dtypeを明示して安全に)
+        det_pos = np.array([d['pos'] for d in detections], dtype=np.float64)            
+        det_sim = np.array([d.get('sim', 1.0) for d in detections], dtype=np.float64)
+        
+        # 足切りの閾値
+        SIM_THRESH = 0.65
 
-        diff_xy = self.particles[:, np.newaxis, :2] - det_pos[np.newaxis, :, :2] 
-        mahal_sq = np.einsum('nmi,ij,nmj->nm', diff_xy, cov_inv, diff_xy)
-        
-        diff_z = self.particles[:, np.newaxis, 2] - det_pos[np.newaxis, :, 2]
-        z_sq = (diff_z / self.std_z) ** 2
-        
-        spatial_likelihoods = np.exp(-0.5 * (mahal_sq + z_sq))
-        
-        uniform_weight = 1.0 / (self.num_particles * 100.0)
-        total_likelihoods = (det_sim[np.newaxis, :] * spatial_likelihoods) + \
-                            ((1.0 - det_sim[np.newaxis, :]) * uniform_weight)
-        
-        best_likelihoods = np.max(total_likelihoods, axis=1) 
-        
-        self.weights *= best_likelihoods
-        self.weights += 1.e-300
-        self.weights /= np.sum(self.weights)
+        # ==========================================
+        # ★修正: JIT関数の呼び出し
+        # ==========================================
+        # num_particles は渡さず、self.weights を渡して書き換えてもらう
+        self.weights = pf_update_jit(
+            self.particles, 
+            self.weights,   # ここに追加
+            det_pos, 
+            det_sim, 
+            cov_inv, 
+            self.std_z, 
+            SIM_THRESH
+        )
         
         self.estimate()
         self.resample()
@@ -491,6 +580,13 @@ class PersonTrackerClickInitNode(Node):
                 if mode == "INIT":
                     self.registered_feature = feat_cpu
                     target_cand.update_feature_gallery(feat_cpu)
+                    
+                    # ==========================================
+                    # ★修正: 登録時は本人確定なのでスコアをMAXにする
+                    # これをしないと初期値0.5 < 閾値0.6 で即LOSTする
+                    # ==========================================
+                    target_cand.last_sim = 1.0 
+                    
                     self.feature_locked = True
                     self.state = "TRACKING"
                 elif mode == "UPDATE":
@@ -507,10 +603,36 @@ class PersonTrackerClickInitNode(Node):
         finally: self.is_reid_running = False
 
     def async_recovery_worker(self, snapshot_candidates):
+        """ LOST時のリカバリー用非同期ワーカー (ギャラリー活用版) """
         try:
-            BATCH_SIZE = 3
+            BATCH_SIZE = 1 # OOM対策
+            
+            # 1. 比較対象となる「ターゲットの特徴量」を準備
             reg_feat = self.registered_feature.to(self.device)
-            if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
+            if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0) # (1, 1024)
+
+            # --- ★追加: ギャラリー情報の統合 ---
+            target_feat = reg_feat # デフォルトは初期値
+            
+            # ターゲット候補オブジェクトが生きていればギャラリーを取得
+            if self.target_candidate:
+                gallery = list(self.target_candidate.feature_gallery)
+                if len(gallery) > 0:
+                    # ギャラリーをテンソル化 (N, 1024)
+                    gallery_tensor = torch.stack(gallery).to(self.device)
+                    
+                    # 平均ベクトルを作成 (1, 1024)
+                    mean_feat = torch.mean(gallery_tensor, dim=0, keepdim=True)
+                    mean_feat = F.normalize(mean_feat, p=2, dim=1)
+                    
+                    # 初期値と平均値をブレンド (重み付け加算)
+                    # 初期値 0.3 : 履歴 0.7 くらいがバランスが良い
+                    alpha = 0.3
+                    mixed_feat = (alpha * reg_feat) + ((1 - alpha) * mean_feat)
+                    
+                    # 再度正規化してターゲット特徴量とする
+                    target_feat = F.normalize(mixed_feat, p=2, dim=1)
+            # ------------------------------------
 
             found_match = False
             best_match_info = None
@@ -521,25 +643,40 @@ class PersonTrackerClickInitNode(Node):
                 features = self.extract_features_batch(batch_input)
                 
                 if features is not None:
-                    sim_scores = torch.mm(features, reg_feat.T).squeeze(1).cpu().numpy()
-                    if sim_scores.ndim == 0: sim_scores = [sim_scores]
-                    best_idx_local = np.argmax(sim_scores)
-                    best_sim = float(sim_scores[best_idx_local])
-                    if best_sim > self.params['reid_sim_thresh']:
-                        found_match = True
-                        best_match_info = (batch_cands[best_idx_local]['id'], best_sim)
-                        break
+                    # 統合した特徴量(target_feat)との類似度を計算
+                    # (Batch, 1024) x (1024, 1) -> (Batch, 1)
+                    sim_matrix = torch.mm(features, target_feat.T)
+                    sim_scores = sim_matrix.flatten().cpu().numpy()
+                    
+                    if len(sim_scores) > 0:
+                        best_idx_local = np.argmax(sim_scores)
+                        best_sim = float(sim_scores[best_idx_local])
+                        
+                        if best_sim > self.params['reid_sim_thresh']:
+                            found_match = True
+                            best_match_info = (batch_cands[best_idx_local]['id'], best_sim)
+                            break
+                
+                del features, batch_input
+                torch.cuda.empty_cache() 
             
             if found_match and best_match_info:
                 cid, sim = best_match_info
                 if cid in self.candidates:
                     cand = self.candidates[cid]
                     self.get_logger().info(f">>> RECOVERY SUCCEEDED! New ID:{cid} (Sim: {sim:.2f})")
+                    
+                    # 以前のギャラリーを引き継ぐ
                     old_gallery = self.target_candidate.feature_gallery if self.target_candidate else None
+                    
                     self.target_candidate = cand
                     self.target_candidate.last_sim = sim
-                    if old_gallery: self.target_candidate.feature_gallery = old_gallery
+                    
+                    if old_gallery:
+                        self.target_candidate.feature_gallery = old_gallery
+                    
                     self.state = "TRACKING"
+
         except Exception as e:
             self.get_logger().error(f"Recovery Err: {e}")
         finally:
@@ -688,12 +825,23 @@ class PersonTrackerClickInitNode(Node):
             cand = self.candidates[cid]
             det = detections[c]
             
-            # マッチ成立: 即座に位置更新 (ReIDスコアは前回のキャッシュを使用)
             used_cand_indices.add(r)
             used_det_indices.add(c)
             
-            # 位置更新には「前回のスコア」を使う（なければ0.5）
-            cached_sim = cand.last_sim if cand.last_sim > 0.001 else 0.5
+            # ==========================================================
+            # ★修正: 登録中(ロック前)のターゲットは、Sim=1.0として強制更新する
+            # これをしないと、初期値0.5 < 足切り0.65 でPFが更新されずドリフトする
+            # ==========================================================
+            is_target_initializing = (self.target_candidate and 
+                                      self.target_candidate.id == cid and 
+                                      not self.feature_locked)
+            
+            if is_target_initializing:
+                cached_sim = 1.0  # 登録中は無条件で信頼
+            else:
+                # 通常時は前回のスコアを使う（なければ0.5）
+                cached_sim = cand.last_sim if cand.last_sim > 0.001 else 0.5
+
             cand.update_state([det], sim_map={0: cached_sim})
             cand.add_points(det['points'])
             active_ids.add(cid)
@@ -766,12 +914,27 @@ class PersonTrackerClickInitNode(Node):
         
         # 1. ターゲット追跡チェック
         if self.target_candidate and self.target_candidate.id in self.candidates:
-            self.target_candidate = self.candidates[self.target_candidate.id]
-            target_found = True
+            cand = self.candidates[self.target_candidate.id]
             
-            # 定期的な特徴更新
+            # =========================================================
+            # ★追加: SimスコアによるLOST判定 (強制ロスト)
+            # =========================================================
+            # 特徴量がロック済み(追跡中)で、かつSimが著しく低い場合はLOST扱いにする
+            # ここでは閾値を 0.6 としています (PFの足切り0.65より少し緩くても良い)
+            LOST_THRESH = 0.7
+            
+            if self.feature_locked and cand.last_sim < LOST_THRESH and cand.last_sim > 0.001:
+                # Simが低すぎる -> 他人と入れ替わっている可能性が高い -> LOSTにする
+                target_found = False
+                self.get_logger().warn(f"Force LOST: Sim {cand.last_sim:.2f} < {LOST_THRESH}")
+            else:
+                # 継続追跡
+                self.target_candidate = cand
+                target_found = True
+            
+            # 定期的な特徴更新 (既存のコード)
             self.execution_count += 1
-            if (self.execution_count % 10 == 0) and not self.is_reid_running:
+            if target_found and (self.execution_count % 10 == 0) and not self.is_reid_running:
                 if len(self.target_candidate.queue) >= 1:
                     self.is_reid_running = True
                     seq_copy = list(self.target_candidate.queue)
