@@ -19,7 +19,7 @@ harrp:
       w_obs: 0.15            # 障害物回避の重み
   
       # --- ロボット設定 ---
-      robot_radius: 0.2     # ロボットの半径 (衝突判定用) [m]
+      robot_radius: 0.23     # ロボットの半径 (衝突判定用) [m]
       goal_tolerance: 0.8   # ゴールとみなす距離 [m] (この距離内で旋回モードへ移行)
       sensor_offset: 0.156    # ロボット中心から見たLiDARの前後位置補正 [m]
   

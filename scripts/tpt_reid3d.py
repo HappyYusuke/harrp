@@ -8,10 +8,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import math
+import json
+import cv2 
+import glob
+import bisect
 import threading
 import struct
-import json
-import bisect
+from numba import jit
 
 # --- Parallel Processing Imports ---
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +33,88 @@ from geometry_msgs.msg import PoseStamped, Point
 from sensor_msgs.msg import PointCloud2
 
 import ros2_numpy as rnp
+
+# ============================
+# JIT Optimized Functions
+# ============================
+@jit(nopython=True, cache=True)
+def pf_predict_jit(particles, dt, process_noise_pos, process_noise_vel):
+    num = particles.shape[0]
+    # ノイズ生成
+    noise_pos = np.random.randn(num, 2) * process_noise_pos
+    noise_z = np.random.randn(num) * (process_noise_pos * 0.1)
+    noise_vel = np.random.randn(num, 2) * process_noise_vel
+    
+    # 状態遷移
+    particles[:, 0] += particles[:, 3] * dt + noise_pos[:, 0]
+    particles[:, 1] += particles[:, 4] * dt + noise_pos[:, 1]
+    particles[:, 2] += particles[:, 5] * dt + noise_z
+    particles[:, 3:5] += noise_vel
+    particles[:, 5] *= 0.5
+    return particles
+
+@jit(nopython=True, cache=True)
+def pf_update_jit(particles, weights, det_pos, det_sim, cov_inv, std_z, sim_thresh):
+    """
+    尤度計算と重み更新を高速計算
+    """
+    N_particles = particles.shape[0]
+    N_dets = det_pos.shape[0]
+    
+    epsilon = 1.0 / (N_particles * 100.0)
+    
+    c00 = cov_inv[0, 0]
+    c01 = cov_inv[0, 1]
+    c10 = cov_inv[1, 0]
+    c11 = cov_inv[1, 1]
+    
+    std_z_sq = std_z ** 2
+
+    for i in range(N_particles):
+        px = particles[i, 0]
+        py = particles[i, 1]
+        pz = particles[i, 2]
+        
+        best_likelihood = 0.0
+        
+        for j in range(N_dets):
+            sim = det_sim[j]
+            
+            if sim < sim_thresh:
+                lik = epsilon
+            else:
+                dx = px - det_pos[j, 0]
+                dy = py - det_pos[j, 1]
+                dz = pz - det_pos[j, 2]
+                
+                # マハラノビス距離の2乗 (XY平面)
+                mahal_sq = (dx * c00 * dx) + (dx * c01 * dy) + (dy * c10 * dx) + (dy * c11 * dy)
+                
+                # Z軸の距離スコア
+                z_sq = (dz**2) / std_z_sq
+                
+                # 空間尤度
+                spatial_prob = np.exp(-0.5 * (mahal_sq + z_sq))
+                
+                # トータル尤度
+                lik = sim * spatial_prob
+                
+                if lik < epsilon:
+                    lik = epsilon
+
+            if lik > best_likelihood:
+                best_likelihood = lik
+        
+        weights[i] *= best_likelihood
+        weights[i] += 1.e-300
+
+    w_sum = np.sum(weights)
+    if w_sum > 0:
+        weights /= w_sum
+    else:
+        weights[:] = 1.0 / N_particles
+
+    return weights
 
 # ============================
 # ReIDモデル設定
@@ -64,19 +149,13 @@ def normalize_point_cloud(points, num_points=256):
     return normalized_points
 
 def preprocess_detection(detection, params):
-    """ 前処理関数 (シングルスレッド実行) """
-    if detection.source_cloud.width * detection.source_cloud.height == 0:
-        return None
-
+    if detection.source_cloud.width * detection.source_cloud.height == 0: return None
     try:
         raw_points = rnp.point_cloud2.pointcloud2_to_xyz_array(detection.source_cloud)
-    except:
-        return None
+    except: return None
 
-    if raw_points.shape[0] < params['min_points']:
-        return None
+    if raw_points.shape[0] < params['min_points']: return None
     
-    # PCAフィルタ
     points_xy = raw_points[:, :2]
     mean_xy = np.mean(points_xy, axis=0)
     centered_xy = points_xy - mean_xy
@@ -85,8 +164,7 @@ def preprocess_detection(detection, params):
     try:
         eigenvalues, _ = np.linalg.eig(cov_matrix)
         eigenvalues = np.sort(eigenvalues)[::-1] 
-    except:
-        return None
+    except: return None
     
     lambda1 = max(eigenvalues[0], 1e-6)
     lambda2 = max(eigenvalues[1], 1e-6)
@@ -102,19 +180,15 @@ def preprocess_detection(detection, params):
 
     norm_points = normalize_point_cloud(raw_points, num_points=params['normalize_num_points'])
     bbox = detection.bbox
-    pos = np.array([bbox.center.position.x, bbox.center.position.y, bbox.center.position.z])
     size = np.array([bbox.size.x, bbox.size.y, bbox.size.z])
+    pos = np.array([bbox.center.position.x, bbox.center.position.y, bbox.center.position.z])
     
     dist_xy = np.hypot(pos[0], pos[1])
-    if dist_xy < params['robot_radius']:
-        return None
+    if dist_xy < params['robot_radius']: return None
 
     return {
-        'pos': pos,
-        'size': size,
-        'ori': bbox.center.orientation,
-        'points': norm_points,
-        'sim': 1.0 # 初期値
+        'pos': pos, 'size': size, 'ori': bbox.center.orientation,
+        'points': norm_points, 'sim': 1.0
     }
 
 # ==========================================
@@ -135,12 +209,10 @@ class ParticleFilterTracker(object):
         self.last_timestamp = None
         self.x = np.zeros(6)
         self.x[:3] = initial_pos
-        
         self.estimated_yaw = 0.0
         
         self.process_noise_pos = params['pf_process_noise_pos']
         self.process_noise_vel = params['pf_process_noise_vel']
-        
         self.std_stopped = params['pf_std_stopped']
         self.std_long_max = params['pf_std_long_max']
         self.std_lat_max = params['pf_std_lat_max']
@@ -148,90 +220,47 @@ class ParticleFilterTracker(object):
         self.std_z = 0.1 
 
     def predict(self, current_time):
-        if self.last_timestamp is None:
-            dt = 0.1
-        else:
-            dt = current_time - self.last_timestamp
+        if self.last_timestamp is None: dt = 0.1
+        else: dt = current_time - self.last_timestamp
         self.last_timestamp = current_time
         
-        self.particles[:, 0] += self.particles[:, 3] * dt
-        self.particles[:, 1] += self.particles[:, 4] * dt
-        self.particles[:, 2] += self.particles[:, 5] * dt
-        
-        self.particles[:, :2] += np.random.randn(self.num_particles, 2) * self.process_noise_pos
-        self.particles[:, 2]  += np.random.randn(self.num_particles) * (self.process_noise_pos * 0.1)
-        self.particles[:, 3:5] += np.random.randn(self.num_particles, 2) * self.process_noise_vel
-        self.particles[:, 5] *= 0.5 
-        
+        self.particles = pf_predict_jit(self.particles, dt, self.process_noise_pos, self.process_noise_vel)
         self.estimate()
         self._update_estimated_yaw()
         return self.x[:3]
 
     def _update_estimated_yaw(self):
-        vx = self.x[3]
-        vy = self.x[4]
+        vx = self.x[3]; vy = self.x[4]
         speed = np.hypot(vx, vy)
-        if speed > 0.1: 
-            self.estimated_yaw = np.arctan2(vy, vx)
+        if speed > 0.1: self.estimated_yaw = np.arctan2(vy, vx)
 
     def _get_adaptive_covariance(self):
-        vx = self.x[3]
-        vy = self.x[4]
+        vx = self.x[3]; vy = self.x[4]
         current_speed = np.hypot(vx, vy)
-        
         ratio = min(current_speed / self.speed_ref, 1.0)
         curr_long = self.std_stopped + (self.std_long_max - self.std_stopped) * ratio
         curr_lat  = self.std_stopped + (self.std_lat_max  - self.std_stopped) * ratio
         
         yaw = self.estimated_yaw
         c, s = np.cos(yaw), np.sin(yaw)
-        
-        l2 = curr_long**2
-        t2 = curr_lat**2
-        
-        a = c*c*l2 + s*s*t2
-        b = c*s*(l2 - t2)
-        d = s*s*l2 + c*c*t2
-        
+        l2 = curr_long**2; t2 = curr_lat**2
+        a = c*c*l2 + s*s*t2; b = c*s*(l2 - t2); d = s*s*l2 + c*c*t2
         det = a*d - b*b
         
-        if abs(det) < 1e-6:
-             cov_inv = np.eye(2) * (1.0 / (self.std_stopped**2))
+        if abs(det) < 1e-6: cov_inv = np.eye(2) * (1.0 / (self.std_stopped**2))
         else:
              inv_det = 1.0 / det
-             cov_inv = np.array([
-                 [d * inv_det, -b * inv_det],
-                 [-b * inv_det, a * inv_det]
-             ])
-             
+             cov_inv = np.array([[d * inv_det, -b * inv_det], [-b * inv_det, a * inv_det]])
         return cov_inv
 
     def update(self, detections):
         if not detections: return
-
         cov_inv = self._get_adaptive_covariance()
+        det_pos = np.array([d['pos'] for d in detections], dtype=np.float64)            
+        det_sim = np.array([d.get('sim', 1.0) for d in detections], dtype=np.float64)
+        SIM_THRESH = 0.65
 
-        det_pos = np.array([d['pos'] for d in detections])           
-        det_sim = np.array([d.get('sim', 1.0) for d in detections])  
-
-        diff_xy = self.particles[:, np.newaxis, :2] - det_pos[np.newaxis, :, :2] 
-        mahal_sq = np.einsum('nmi,ij,nmj->nm', diff_xy, cov_inv, diff_xy)
-        
-        diff_z = self.particles[:, np.newaxis, 2] - det_pos[np.newaxis, :, 2]
-        z_sq = (diff_z / self.std_z) ** 2
-        
-        spatial_likelihoods = np.exp(-0.5 * (mahal_sq + z_sq))
-        
-        uniform_weight = 1.0 / (self.num_particles * 100.0)
-        total_likelihoods = (det_sim[np.newaxis, :] * spatial_likelihoods) + \
-                            ((1.0 - det_sim[np.newaxis, :]) * uniform_weight)
-        
-        best_likelihoods = np.max(total_likelihoods, axis=1) 
-        
-        self.weights *= best_likelihoods
-        self.weights += 1.e-300
-        self.weights /= np.sum(self.weights)
-        
+        self.weights = pf_update_jit(self.particles, self.weights, det_pos, det_sim, cov_inv, self.std_z, SIM_THRESH)
         self.estimate()
         self.resample()
         self._update_estimated_yaw()
@@ -258,8 +287,7 @@ class ParticleFilterTracker(object):
 class KalmanBoxTracker(object):
     def __init__(self, initial_pos): 
         self.pos = initial_pos
-        self.x = np.zeros(6)
-        self.x[:3] = initial_pos
+        self.x = np.zeros(6); self.x[:3] = initial_pos
     def predict(self, current_time): return self.pos
     def update(self, detections):
         if not detections: return
@@ -276,14 +304,12 @@ class Candidate:
         self.orientation = orientation
         self.queue = collections.deque(maxlen=params['sequence_length'])
         self.queue.append(initial_points)
-        self.last_sim = 0.5 # 初期値
+        self.last_sim = 0.5 
         self.feature_gallery = collections.deque(maxlen=params['gallery_size'])
         self.algo = params['tracking_algo']
         
-        if self.algo == "PF":
-            self.kf = ParticleFilterTracker(pos, params)
-        else:
-            self.kf = KalmanBoxTracker(pos)
+        if self.algo == "PF": self.kf = ParticleFilterTracker(pos, params)
+        else: self.kf = KalmanBoxTracker(pos)
         
         self.pos = pos 
         self.pred_pos = pos 
@@ -302,10 +328,8 @@ class Candidate:
 
         self.kf.update(valid_detections)
         
-        if hasattr(self.kf, 'x'):
-            self.pos = self.kf.x[:3]
-        else:
-            self.pos = self.kf.pos
+        if hasattr(self.kf, 'x'): self.pos = self.kf.x[:3]
+        else: self.pos = self.kf.pos
 
         if valid_detections:
             dists = [np.linalg.norm(self.pos - d['pos']) for d in valid_detections]
@@ -315,10 +339,8 @@ class Candidate:
             
             if hasattr(self.kf, 'estimated_yaw'):
                 yaw = self.kf.estimated_yaw
-                cy = math.cos(yaw * 0.5)
-                sy = math.sin(yaw * 0.5)
                 q = self.orientation
-                q.w, q.x, q.y, q.z = cy, 0.0, 0.0, sy
+                q.w, q.x, q.y, q.z = math.cos(yaw*0.5), 0.0, 0.0, math.sin(yaw*0.5)
                 self.orientation = q
             else:
                 self.orientation = best_det['ori']
@@ -359,23 +381,26 @@ class PersonTrackerClickInitNode(Node):
                 ('tracking.pf_std_lat_max', 0.25),
                 ('tracking.pf_max_speed_ref', 1.5),
                 ('reid.weight_path', f'{HOME_DIR}/ReID3D/reidnet/log/ckpt_best.pth'),
-                ('reid.sim_thresh', 0.70),
+                ('reid.sim_thresh', 0.80),
                 ('reid.sequence_length', 30),
                 ('reid.gallery_size', 100),
                 ('reid.feature_dim', 1024),
                 ('reid.num_class', 222),
-                ('reid.verify_thresh', 0.7),
+                ('reid.verify_thresh', 0.4),
                 ('detection.pca_wall_thresh', 0.35),
                 ('detection.pca_ratio_thresh', 5.0),
                 ('detection.pca_radial_thresh', 0.04),
                 ('detection.min_points', 5),
                 ('detection.normalize_num_points', 256),
                 ('detection.robot_radius', 0.45),
-                ('target_selection.mode', 1),
+                ('target_selection.mode', 0),
                 ('target_selection.auto_x_min', 0.0),
                 ('target_selection.auto_x_max', 3.0),
                 ('target_selection.auto_y_min', -0.5),
                 ('target_selection.auto_y_max', 0.5),
+                # ★追加: ベンチマーク用パラメータ
+                ('benchmark.gt_json_path', f'{HOME_DIR}/tpt-bench/GTs/0015.json'),
+                ('benchmark.output_json_path', 'evaluation_results.json'),
             ]
         )
 
@@ -408,23 +433,14 @@ class PersonTrackerClickInitNode(Node):
             'auto_x_max': self.get_parameter('target_selection.auto_x_max').value,
             'auto_y_min': self.get_parameter('target_selection.auto_y_min').value,
             'auto_y_max': self.get_parameter('target_selection.auto_y_max').value,
+            'gt_json_path': self.get_parameter('benchmark.gt_json_path').value,
+            'output_json_path': self.get_parameter('benchmark.output_json_path').value,
         }
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.set_num_threads(4)
         self.net = self._load_model()
         self.get_logger().info(f'Model Loaded on {self.device}')
-
-        # ★TPT-BENCH: GTタイムスタンプの読み込み
-        self.gt_timestamps = []
-        gt_path = os.path.expanduser("~/tpt-bench/GTs/0035_dark.json") 
-        if os.path.exists(gt_path):
-            with open(gt_path, 'r') as f:
-                gt_data = json.load(f)
-                self.gt_timestamps = sorted([int(k) for k in gt_data.keys()])
-            self.get_logger().info(f">>> Loaded {len(self.gt_timestamps)} DARK frames from {gt_path}")
-        else:
-            self.get_logger().error(f"GT file not found: {gt_path}")
 
         self.qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.sub_bbox = self.create_subscription(Detection3DArray, '/bbox', self.bbox_callback, self.qos)
@@ -444,6 +460,16 @@ class PersonTrackerClickInitNode(Node):
         self.next_candidate_id = 0
         self.json_results = {}
         
+        # --- GT Load ---
+        self.gt_timestamps = []
+        if os.path.exists(self.params['gt_json_path']):
+            with open(self.params['gt_json_path'], 'r') as f:
+                gt_data = json.load(f)
+                self.gt_timestamps = sorted([int(k) for k in gt_data.keys()])
+            self.get_logger().info(f">>> Loaded {len(self.gt_timestamps)} GT frames from {self.params['gt_json_path']}")
+        else:
+            self.get_logger().error(f"GT file not found: {self.params['gt_json_path']}")
+
         # 非同期処理管理
         self.reid_thread = None
         self.recovery_thread = None
@@ -455,6 +481,7 @@ class PersonTrackerClickInitNode(Node):
         self.execution_count = 0
 
     def destroy_node(self):
+        self.save_results_to_json()
         super().destroy_node()
 
     def _load_model(self):
@@ -505,6 +532,9 @@ class PersonTrackerClickInitNode(Node):
                 if mode == "INIT":
                     self.registered_feature = feat_cpu
                     target_cand.update_feature_gallery(feat_cpu)
+                    
+                    target_cand.last_sim = 1.0 
+                    
                     self.feature_locked = True
                     self.state = "TRACKING"
                 elif mode == "UPDATE":
@@ -522,9 +552,22 @@ class PersonTrackerClickInitNode(Node):
 
     def async_recovery_worker(self, snapshot_candidates):
         try:
-            BATCH_SIZE = 1  # ★修正: 1人ずつ処理してOOM回避
+            BATCH_SIZE = 1 
+            
             reg_feat = self.registered_feature.to(self.device)
             if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
+
+            target_feat = reg_feat 
+            
+            if self.target_candidate:
+                gallery = list(self.target_candidate.feature_gallery)
+                if len(gallery) > 0:
+                    gallery_tensor = torch.stack(gallery).to(self.device)
+                    mean_feat = torch.mean(gallery_tensor, dim=0, keepdim=True)
+                    mean_feat = F.normalize(mean_feat, p=2, dim=1)
+                    alpha = 0.3
+                    mixed_feat = (alpha * reg_feat) + ((1 - alpha) * mean_feat)
+                    target_feat = F.normalize(mixed_feat, p=2, dim=1)
 
             found_match = False
             best_match_info = None
@@ -535,18 +578,18 @@ class PersonTrackerClickInitNode(Node):
                 features = self.extract_features_batch(batch_input)
                 
                 if features is not None:
-                    sim_matrix = torch.mm(features, reg_feat.T)
-                    sim_scores = sim_matrix.flatten().cpu().numpy() # ★修正: Flattenで1次元化
+                    sim_matrix = torch.mm(features, target_feat.T)
+                    sim_scores = sim_matrix.flatten().cpu().numpy()
                     
                     if len(sim_scores) > 0:
                         best_idx_local = np.argmax(sim_scores)
                         best_sim = float(sim_scores[best_idx_local])
+                        
                         if best_sim > self.params['reid_sim_thresh']:
                             found_match = True
                             best_match_info = (batch_cands[best_idx_local]['id'], best_sim)
                             break
                 
-                # ★修正: メモリ解放
                 del features, batch_input
                 torch.cuda.empty_cache() 
             
@@ -555,11 +598,17 @@ class PersonTrackerClickInitNode(Node):
                 if cid in self.candidates:
                     cand = self.candidates[cid]
                     self.get_logger().info(f">>> RECOVERY SUCCEEDED! New ID:{cid} (Sim: {sim:.2f})")
+                    
                     old_gallery = self.target_candidate.feature_gallery if self.target_candidate else None
+                    
                     self.target_candidate = cand
                     self.target_candidate.last_sim = sim
-                    if old_gallery: self.target_candidate.feature_gallery = old_gallery
+                    
+                    if old_gallery:
+                        self.target_candidate.feature_gallery = old_gallery
+                    
                     self.state = "TRACKING"
+
         except Exception as e:
             self.get_logger().error(f"Recovery Err: {e}")
         finally:
@@ -567,7 +616,7 @@ class PersonTrackerClickInitNode(Node):
 
     def async_sim_update_worker(self, reid_jobs):
         try:
-            BATCH_SIZE = 1  # ★修正: 1人ずつ処理
+            BATCH_SIZE = 3
             reg_feat = self.registered_feature.to(self.device)
             if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
 
@@ -578,16 +627,12 @@ class PersonTrackerClickInitNode(Node):
                 features = self.extract_features_batch(batch_input)
                 if features is not None:
                     sim_matrix = torch.mm(features, reg_feat.T)
-                    sim_scores = sim_matrix.flatten().cpu().numpy() # ★修正: Flatten
+                    sim_scores = sim_matrix.flatten().cpu().numpy()
                     
-                    for (cid, _), score in zip(batch, sim_scores): # ★修正: zipで安全ループ
+                    for (cid, _), score in zip(batch, sim_scores):
                         if cid in self.candidates:
                             self.candidates[cid].last_sim = float(score)
-                
-                # ★修正: メモリ解放
-                del features, batch_input
-                torch.cuda.empty_cache()
-
+                            
         except Exception as e:
             self.get_logger().error(f"Sim Update Err: {e}")
         finally:
@@ -607,45 +652,16 @@ class PersonTrackerClickInitNode(Node):
             self.registered_feature = None
             self.state = "INITIALIZING"
 
-    def get_2d_target_info(self, candidate):
-        pos_3d = candidate.pos
-        size_3d = candidate.size
-        confidence = candidate.last_sim if candidate.last_sim > 0 else 1.0
-        img_w = 1920
-        img_h = 960
-        x, y, z = pos_3d[0], pos_3d[1], pos_3d[2]
-        theta = math.atan2(y, x) 
-        dist_2d = math.sqrt(x**2 + y**2)
-        camera_height_offset = 0.4
-        phi = math.atan2(z - camera_height_offset, dist_2d)      
-        u = (0.5 - theta / (2 * math.pi)) * img_w
-        v = (0.5 - phi / math.pi) * img_h
-        dist_3d = math.sqrt(x**2 + y**2 + z**2)
-        if dist_3d < 0.1: dist_3d = 0.1
-        w_2d = (size_3d[1] / dist_3d) * (img_w / (2 * math.pi)) * 1.4
-        h_2d = (size_3d[2] / dist_3d) * (img_h / math.pi) * 1.4
-        u_tl = int(u - (w_2d / 2))
-        v_tl = int(v - (h_2d / 2))
-        u_tl = int(u_tl % img_w)
-        return [u_tl, v_tl, int(w_2d), int(h_2d), confidence]
-
-    def save_results_to_json(self):
-        filename = 'evaluation_results.json'
-        try:
-            with open(filename, 'w') as f:
-                json.dump(self.json_results, f, indent=4)
-        except Exception as e:
-            self.get_logger().error(f"Failed to save JSON: {e}")
-
     def bbox_callback(self, msg: Detection3DArray):
         current_time = time.time()
         
-        # ★TPT-BENCH: タイムスタンプ同期
+        # --- GT Sync: Timestamp Extraction ---
         if hasattr(msg.header.stamp, 'sec'):
             raw_ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
         else:
             raw_ts = msg.header.stamp.nanoseconds
 
+        # --- GT Sync: Find Nearest Timestamp ---
         target_timestamp_str = None
         if self.gt_timestamps:
             idx = bisect.bisect_left(self.gt_timestamps, raw_ts)
@@ -654,6 +670,7 @@ class PersonTrackerClickInitNode(Node):
             if idx > 0: candidates.append(self.gt_timestamps[idx - 1])
             if candidates:
                 nearest_ts = min(candidates, key=lambda x: abs(x - raw_ts))
+                # 許容誤差 (例: 100ms = 100,000,000ns)
                 if abs(nearest_ts - raw_ts) < 100000000:
                     target_timestamp_str = str(nearest_ts)
 
@@ -664,8 +681,7 @@ class PersonTrackerClickInitNode(Node):
         
         self.update_candidates(detections, current_time)
 
-        # ★TPT-BENCH: 評価データの蓄積
-        current_json_data = [0, 0, 0, 0, -1] # デフォルト(Lost)
+        current_json_data = [0, 0, 0, 0, -1] # Default: [u, v, w, h, conf]
 
         if self.state == "WAIT_FOR_CLICK":
             if self.params['choose_target_from_rviz2'] == 0: self.process_auto_front_selection()
@@ -678,8 +694,6 @@ class PersonTrackerClickInitNode(Node):
             self.process_autonomous_tracking()
             if self.state == "TRACKING" and self.target_candidate:
                 current_json_data = self.get_2d_target_info(self.target_candidate)
-                
-                # Pose出力
                 pose_msg = PoseStamped()
                 pose_msg.header = msg.header
                 pose_msg.pose.position.x = float(self.target_candidate.pos[0])
@@ -687,16 +701,23 @@ class PersonTrackerClickInitNode(Node):
                 pose_msg.pose.position.z = float(self.target_candidate.pos[2])
                 pose_msg.pose.orientation = self.target_candidate.orientation
                 self.pub_target_pose.publish(pose_msg)
-
-        # JSONへの記録
+        
+        # --- GT Sync: Save Result ---
         if target_timestamp_str is not None:
+            # ターゲットID (初期化前やLOST時は0, TRACKING中はID)
+            # TPTの仕様では、ターゲットを見失っているときはIDを維持するか、あるいはconfを低くするか等の規定があるが
+            # ここでは「現在追跡対象としているID」を保存する。
             target_id = self.target_candidate.id if self.target_candidate else 0
+            
+            # フォーマット: [target_id, u, v, w, h, confidence]
             tracks_list = [[target_id] + current_json_data]
+            
             self.json_results[target_timestamp_str] = {
                 "target_info": current_json_data, 
                 "tracks_target_conf_bbox": tracks_list
             }
-            if len(self.json_results) % 50 == 0:
+            # 定期保存 (クラッシュ対策)
+            if len(self.json_results) % 100 == 0:
                 self.save_results_to_json()
 
         self.publish_visualization(msg.header)
@@ -752,7 +773,10 @@ class PersonTrackerClickInitNode(Node):
         used_det_indices = set()
         match_dist = self.params['match_dist_thresh']
         
+        # --- ペアリングと即時位置更新 ---
+        
         reid_jobs = [] 
+        
         target_pos = None
         if self.target_candidate:
             target_pos = self.target_candidate.pos
@@ -768,11 +792,20 @@ class PersonTrackerClickInitNode(Node):
             used_cand_indices.add(r)
             used_det_indices.add(c)
             
-            cached_sim = cand.last_sim if cand.last_sim > 0.001 else 0.5
+            is_target_initializing = (self.target_candidate and 
+                                      self.target_candidate.id == cid and 
+                                      not self.feature_locked)
+            
+            if is_target_initializing:
+                cached_sim = 1.0  
+            else:
+                cached_sim = cand.last_sim if cand.last_sim > 0.001 else 0.5
+
             cand.update_state([det], sim_map={0: cached_sim})
             cand.add_points(det['points'])
             active_ids.add(cid)
             
+            # --- ReIDが必要か判定 ---
             is_target = (self.target_candidate and self.target_candidate.id == cid)
             is_neighbor = False
             if target_pos is not None and not is_target:
@@ -833,11 +866,20 @@ class PersonTrackerClickInitNode(Node):
 
     def process_autonomous_tracking(self):
         target_found = False
+        
         if self.target_candidate and self.target_candidate.id in self.candidates:
-            self.target_candidate = self.candidates[self.target_candidate.id]
-            target_found = True
+            cand = self.candidates[self.target_candidate.id]
+            
+            LOST_THRESH = 0.7
+            if self.feature_locked and cand.last_sim < LOST_THRESH and cand.last_sim > 0.001:
+                target_found = False
+                self.get_logger().warn(f"Force LOST: Sim {cand.last_sim:.2f} < {LOST_THRESH}")
+            else:
+                self.target_candidate = cand
+                target_found = True
+            
             self.execution_count += 1
-            if (self.execution_count % 10 == 0) and not self.is_reid_running:
+            if target_found and (self.execution_count % 10 == 0) and not self.is_reid_running:
                 if len(self.target_candidate.queue) >= 1:
                     self.is_reid_running = True
                     seq_copy = list(self.target_candidate.queue)
@@ -861,6 +903,31 @@ class PersonTrackerClickInitNode(Node):
                     self.is_recovery_running = True
                     self.recovery_thread = threading.Thread(target=self.async_recovery_worker, args=(snapshot_candidates,))
                     self.recovery_thread.start()
+
+    def get_2d_target_info(self, candidate):
+        pos_3d = candidate.pos
+        size_3d = candidate.size
+        confidence = candidate.last_sim if candidate.last_sim > 0 else 1.0
+        
+        # 3D to 2D projection (Cylindrical panorama)
+        img_w = 1920
+        img_h = 960
+        x, y, z = pos_3d[0], pos_3d[1], pos_3d[2]
+        theta = math.atan2(y, x) 
+        dist_2d = math.sqrt(x**2 + y**2)
+        camera_height_offset = 0.4
+        phi = math.atan2(z - camera_height_offset, dist_2d)      
+        u = (0.5 - theta / (2 * math.pi)) * img_w
+        v = (0.5 - phi / math.pi) * img_h
+        dist_3d = math.sqrt(x**2 + y**2 + z**2)
+        if dist_3d < 0.1: dist_3d = 0.1
+        w_2d = (size_3d[1] / dist_3d) * (img_w / (2 * math.pi)) #* 1.4
+        h_2d = (size_3d[2] / dist_3d) * (img_h / math.pi) #* 1.4
+        u_tl = int(u - (w_2d / 2))
+        v_tl = int(v - (h_2d / 2))
+        u_tl = int(u_tl % img_w)
+        
+        return [u_tl, v_tl, int(w_2d), int(h_2d), confidence]
 
     def publish_status_marker_3d(self, header):
         marker = Marker()
@@ -907,18 +974,28 @@ class PersonTrackerClickInitNode(Node):
         self.pub_markers.publish(marker_array)
         if len(all_particles_xyz) > 0:
             points_np = np.vstack(all_particles_xyz)
-            
-            data = np.zeros(len(points_np), dtype=[('x', np.float32), ('y', np.float32), ('z', np.float32)])
-            data['x'], data['y'], data['z'] = points_np[:, 0], points_np[:, 1], points_np[:, 2]
+            #red_color_float = np.array([0xFF0000], dtype=np.uint32).view(np.float32)[0]
+            data = np.zeros(len(points_np), dtype=[('x', np.float32), ('y', np.float32), ('z', np.float32)])#, ('rgb', np.float32)])
+            data['x'], data['y'], data['z'] = points_np[:, 0], points_np[:, 1], points_np[:, 2]#, red_color_float
             msg = rnp.msgify(PointCloud2, data); msg.header = header
             self.pub_particles.publish(msg)
+
+    def save_results_to_json(self):
+        filename = self.params['output_json_path']
+        self.get_logger().info(f"Saving JSON results to {filename} ...")
+        try:
+            with open(filename, 'w') as f:
+                json.dump(self.json_results, f, indent=4)
+            self.get_logger().info("Save Complete!")
+        except Exception as e:
+            self.get_logger().error(f"Failed to save JSON: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
     node = PersonTrackerClickInitNode()
     try: rclpy.spin(node)
     except KeyboardInterrupt: pass
-    finally: node.save_results_to_json(); node.destroy_node(); rclpy.shutdown()
+    finally: node.destroy_node(); rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

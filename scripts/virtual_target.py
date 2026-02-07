@@ -16,8 +16,8 @@ class VirtualTarget(Node):
         self.start_time = time.time()
         
         # --- 変更: 位置調整用のパラメータ ---
-        self.center_x = -2.1
-        self.center_y = -6.9  # ★追加: Y軸方向の中心位置 (ここを変更して調整)
+        self.center_x = -5.2018
+        self.center_y = -0.6342  # ★追加: Y軸方向の中心位置 (ここを変更して調整)
         self.radius = 1.5    # 半径
         self.speed = 0.0     # 回転速度
         # --------------------------------
