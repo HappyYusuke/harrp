@@ -84,7 +84,7 @@ def mpc_cost_jit(u_flat, current_state, target, obstacles,
 
             if min_obs_dist < robot_radius:
                 cost += w_obs * (1.0 / (min_obs_dist + 0.001)) * 100.0
-            elif min_obs_dist < robot_radius + 0.5:
+            elif min_obs_dist < robot_radius + 0.05:
                 cost += w_obs * (1.0 / min_obs_dist)
                 
     return cost
@@ -331,7 +331,7 @@ class MPCController(Node):
             xyz = xyz[mask_dist]
             dists_sq = dists_sq[mask_dist]
             
-            MAX_OBSTACLES = 300
+            MAX_OBSTACLES = 1000
             if xyz.shape[0] > MAX_OBSTACLES:
                 nearest_indices = np.argpartition(dists_sq, MAX_OBSTACLES)[:MAX_OBSTACLES]
                 xyz = xyz[nearest_indices]
@@ -572,7 +572,7 @@ class MPCController(Node):
         msg = Twist()
         msg.linear.x = float(v)
         msg.angular.z = float(w)
-        #self.cmd_vel_pub.publish(msg)
+        self.cmd_vel_pub.publish(msg)
         self.publish_path(path)
         self.publish_obstacles()
         self.publish_robot_radius()
