@@ -14,7 +14,7 @@ harrp:
       reid:
         sim_thresh: 0.80          # ReIDの類似度閾値 (0.0 ~ 1.0)
         sequence_length: 30       # 特徴量抽出に使うフレーム数
-        gallery_size: 20         # 過去の特徴量を保存する数
+        gallery_size: 10         # 過去の特徴量を保存する数
         feature_dim: 1024         # ネットワークの特徴量次元
         num_class: 222            # ネットワークのクラス数
   

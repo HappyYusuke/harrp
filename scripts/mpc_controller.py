@@ -22,16 +22,20 @@ from numba import jit
 # ==========================================
 # JITコンパイル関数
 # ==========================================
-@jit(nopython=True, cache=True)
+
+@jit(nopython=True, cache=True, fastmath=True)
 def predict_next_state_jit(state, v, w, dt):
     x, y, yaw, _, _ = state
     x += v * np.cos(yaw) * dt
     y += v * np.sin(yaw) * dt
     yaw += w * dt
-    yaw = (yaw + np.pi) % (2 * np.pi) - np.pi
+    if yaw > np.pi:
+        yaw -= 2 * np.pi
+    elif yaw < -np.pi:
+        yaw += 2 * np.pi
     return np.array([x, y, yaw, v, w])
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def mpc_cost_jit(u_flat, current_state, target, obstacles, 
                  horizon, dt, 
                  w_dist, w_heading, w_vel, w_obs, 
@@ -41,8 +45,9 @@ def mpc_cost_jit(u_flat, current_state, target, obstacles,
     curr_state = current_state.copy()
     u = u_flat.reshape((horizon, 2))
     
-    # 障害物判定用の「2乗された半径」を事前計算
     robot_radius_sq = robot_radius ** 2
+    collision_thresh_sq = (robot_radius + 0.15) ** 2
+    num_obs = len(obstacles)
     
     for i in range(horizon):
         v = u[i, 0]
@@ -56,38 +61,58 @@ def mpc_cost_jit(u_flat, current_state, target, obstacles,
         # --- ゴール到達コスト ---
         dx = target[0] - px
         dy = target[1] - py
-        dist = np.sqrt(dx*dx + dy*dy)
-        cost += w_dist * dist
+        dist_sq = dx*dx + dy*dy
+        cost += w_dist * np.sqrt(dist_sq)
         
         # --- 向きのコスト ---
         target_yaw = np.arctan2(dy, dx)
         yaw_diff = np.abs(target_yaw - pyaw)
-        yaw_diff = (yaw_diff + np.pi) % (2 * np.pi) - np.pi
-        cost += w_heading * np.abs(yaw_diff)
+        if yaw_diff > np.pi:
+            yaw_diff = 2 * np.pi - yaw_diff
+        cost += w_heading * yaw_diff
         
         # --- 速度維持コスト ---
-        target_v = max_speed if dist > 1.0 else 0.0
+        target_v = max_speed if dist_sq > 1.0 else 0.0
         cost += w_vel * np.abs(target_v - v)
         
-        # --- 障害物回避コスト (最適化版) ---
-        if len(obstacles) > 0:
-            min_obs_dist_sq = 10000.0 ** 2
-            
-            for j in range(len(obstacles)):
+        # --- 障害物回避コスト ---
+        if num_obs > 0:
+            min_obs_dist_sq = 10000.0
+            for j in range(num_obs):
                 ox = obstacles[j, 0]
                 oy = obstacles[j, 1]
                 d_sq = (ox - px)**2 + (oy - py)**2
                 if d_sq < min_obs_dist_sq:
                     min_obs_dist_sq = d_sq
 
-            min_obs_dist = np.sqrt(min_obs_dist_sq)
-
-            if min_obs_dist < robot_radius:
-                cost += w_obs * (1.0 / (min_obs_dist + 0.001)) * 100.0
-            elif min_obs_dist < robot_radius + 0.05:
-                cost += w_obs * (1.0 / min_obs_dist)
+            if min_obs_dist_sq < collision_thresh_sq:
+                min_obs_dist = np.sqrt(min_obs_dist_sq)
+                if min_obs_dist < robot_radius:
+                    cost += w_obs * (1.0 / (min_obs_dist + 0.001)) * 100.0
+                else:
+                    cost += w_obs * (1.0 / min_obs_dist)
                 
     return cost
+
+@jit(nopython=True, cache=True, fastmath=True)
+def process_lidar_jit(xyz, sensor_offset, robot_radius, max_points):
+    x_in_base = xyz[:, 0] + sensor_offset
+    y_in_base = xyz[:, 1]
+    
+    dists_sq = x_in_base**2 + y_in_base**2
+    robot_radius_sq = robot_radius ** 2
+    max_dist_sq = 5.0 ** 2 
+    
+    mask = (dists_sq > robot_radius_sq) & (dists_sq < max_dist_sq)
+    valid_xyz = xyz[mask]
+    num_valid = len(valid_xyz)
+    
+    if num_valid > max_points:
+        step = num_valid // max_points
+        downsampled = valid_xyz[::step]
+        return downsampled[:max_points]
+    else:
+        return valid_xyz
 
 # ==========================================
 
@@ -95,20 +120,20 @@ class MPCConfig:
     def __init__(self):
         self.max_speed = 0.8
         self.min_speed = 0.0
-        self.max_yaw_rate = 1.2
-        self.max_accel = 0.5
-        self.max_dyaw_rate = 2.0
-        self.dt = 0.2            
-        self.horizon = 8        
-        self.w_dist = 1.0        
-        self.w_heading = 0.5     
-        self.w_vel = 1.5        
-        self.w_obs = 0.8        
-        self.robot_radius = 0.3 
-        self.goal_tolerance = 0.5
-        self.sensor_offset = 0.0
-        self.turn_kp = 1.5
-        self.turn_kd = 0.5
+        self.max_yaw_rate = 1.0
+        self.max_accel = 1.0
+        self.max_dyaw_rate = 5.0 
+        self.dt = 0.1
+        self.horizon = 20
+        self.w_dist = 0.3
+        self.w_heading = 0.2
+        self.w_vel = 0.3
+        self.w_obs = 0.2
+        self.robot_radius = 0.23
+        self.goal_tolerance = 0.8
+        self.sensor_offset = 0.156
+        self.turn_kp = 0.5
+        self.turn_kd = 0.2
         self.turn_yaw_tolerance = 0.1
         self.min_height = -0.05
         self.max_height = 0.1
@@ -119,7 +144,6 @@ class MPCController(Node):
     def __init__(self):
         super().__init__('mpc_controller')
         self.config = MPCConfig()
-        
         self.cb_group = ReentrantCallbackGroup()
 
         self.declare_parameters(
@@ -181,7 +205,8 @@ class MPCController(Node):
         self.current_yaw_rate = 0.0
         
         self.target_local = None 
-        self.target_odom = None  
+        # 変数名を target_odom から target_pose_in_odom に変更（混乱防止）
+        self.target_pose_in_odom = None  
         self.last_target_time = None
         self.sensor_frame_id = "livox_frame"
         self.is_tracker_lost = False
@@ -193,7 +218,6 @@ class MPCController(Node):
         
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-
         self.tf_broadcaster = TransformBroadcaster(self)
         
         self.timer = self.create_timer(
@@ -236,17 +260,14 @@ class MPCController(Node):
         self.current_vel = msg.twist.twist.linear.x
         self.current_yaw_rate = msg.twist.twist.angular.z
 
-        # Rviz同期のため現在時刻でTF配信
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = 'odom'
         t.child_frame_id = 'base_link'
-
         t.transform.translation.x = msg.pose.pose.position.x
         t.transform.translation.y = msg.pose.pose.position.y
         t.transform.translation.z = msg.pose.pose.position.z
         t.transform.rotation = msg.pose.pose.orientation
-
         self.tf_broadcaster.sendTransform(t)
 
     def status_callback(self, msg):
@@ -256,38 +277,36 @@ class MPCController(Node):
             self.is_tracker_lost = False
 
     def target_callback(self, msg):
-        # ★修正1: self.sensor_frame_id は LiDAR 用なので、ここでは更新しない！
-        # これを更新してしまうと、publish_obstacles がターゲットのフレーム(odom)を
-        # 使ってしまい、障害物がずれて表示される原因になります。
-        
         self.last_target_time = self.get_clock().now()
         self.is_tracker_lost = False
 
-        self.target_odom = msg 
-
-        # 2. MPC制御用: base_link座標系に変換
         try:
-            # ★修正2: TFエラー対策
-            # メッセージのタイムスタンプをそのまま使うと "extrapolation into the future" になるため
-            # 現在時刻(Time 0)として扱うための一時メッセージを作成します。
+            # ★修正: ここで受け取ったメッセージ（livox_frameなど）を、
+            # 即座に 'base_link' (制御用) と 'odom' (保存/表示用) の両方に変換する。
             
+            # タイムスタンプのズレ防止のため、現在時刻(0)で再構築
             target_msg_now = PoseStamped()
             target_msg_now.header.frame_id = msg.header.frame_id
-            target_msg_now.header.stamp = rclpy.time.Time().to_msg() # 最新として扱う
+            target_msg_now.header.stamp = rclpy.time.Time().to_msg() 
             target_msg_now.pose = msg.pose
             
             transform_timeout = rclpy.duration.Duration(seconds=0.1)
-            target_in_base_link = self.tf_buffer.transform(
-                target_msg_now, 
-                'base_link', 
-                timeout=transform_timeout
-            )
             
+            # 1. MPC制御用: base_link への変換
+            target_in_base_link = self.tf_buffer.transform(
+                target_msg_now, 'base_link', timeout=transform_timeout
+            )
             self.target_local = np.array([
                 target_in_base_link.pose.position.x, 
                 target_in_base_link.pose.position.y
             ])
-            
+
+            # 2. 保存・表示・ロスト復帰用: odom への変換 (★重要)
+            # これを保存しておけば、マーカー表示やロスト時に正しい世界座標を使える
+            self.target_pose_in_odom = self.tf_buffer.transform(
+                target_msg_now, 'odom', timeout=transform_timeout
+            )
+
         except (LookupException, ConnectivityException, ExtrapolationException) as e:
             self.get_logger().warn(f"Transform Error in callback: {e}")
 
@@ -296,9 +315,7 @@ class MPCController(Node):
         try:
             point_step = msg.point_step
             raw_uint8 = np.frombuffer(msg.data, dtype=np.uint8)
-            
-            if len(raw_uint8) % point_step != 0:
-                return
+            if len(raw_uint8) % point_step != 0: return
             
             num_points = len(raw_uint8) // point_step
             points_data = raw_uint8.reshape(num_points, point_step)
@@ -319,35 +336,21 @@ class MPCController(Node):
             mask_z = (xyz[:, 2] > self.config.min_height) & (xyz[:, 2] < self.config.max_height)
             xyz = xyz[mask_z]
             
-            # フィルタリング計算用（オフセット考慮）
-            x_in_base = xyz[:, 0] + self.config.sensor_offset
-            y_in_base = xyz[:, 1]
-            dists_sq = x_in_base**2 + y_in_base**2
-            
-            robot_radius_sq = self.config.robot_radius ** 2
-            max_dist_sq = 5.0 ** 2
-            
-            mask_dist = (dists_sq > robot_radius_sq) & (dists_sq < max_dist_sq)
-            xyz = xyz[mask_dist]
-            dists_sq = dists_sq[mask_dist]
-            
             MAX_OBSTACLES = 1000
-            if xyz.shape[0] > MAX_OBSTACLES:
-                nearest_indices = np.argpartition(dists_sq, MAX_OBSTACLES)[:MAX_OBSTACLES]
-                xyz = xyz[nearest_indices]
             
-            if xyz.shape[0] > 0:
-                self.obstacles_local = xyz[:, :2].astype(np.float64)
-            else:
-                self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
+            self.obstacles_local = process_lidar_jit(
+                xyz, 
+                self.config.sensor_offset, 
+                self.config.robot_radius, 
+                MAX_OBSTACLES
+            ).astype(np.float64)
                 
         except Exception as e:
             self.get_logger().warn(f"Lidar Processing Error: {e}")
             self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
 
     def get_target_for_mpc(self):
-        if self.last_target_time is None:
-            return None
+        if self.last_target_time is None: return None
 
         elapsed = (self.get_clock().now() - self.last_target_time).nanoseconds / 1e9
         is_lost_condition = self.is_tracker_lost or (elapsed > self.config.lost_timeout)
@@ -355,29 +358,25 @@ class MPCController(Node):
         if not is_lost_condition:
             return self.target_local
         else:
-            if self.target_odom is None:
-                return None
-
+            # ロスト時: 保存しておいた odom 座標（世界座標）を使用
+            if self.target_pose_in_odom is None: return None
+            
             try:
                 transform_timeout = rclpy.duration.Duration(seconds=0.1)
                 
-                # エラー対策: タイムスタンプを現在時刻に書き換えてから変換
+                # odom座標にあるターゲットを、現在の base_link から見た位置に再計算
                 target_msg = PoseStamped()
-                target_msg.header.frame_id = self.target_odom.header.frame_id
+                target_msg.header.frame_id = 'odom' # 確実にodom
                 target_msg.header.stamp = rclpy.time.Time().to_msg()
-                target_msg.pose = self.target_odom.pose
+                target_msg.pose = self.target_pose_in_odom.pose
 
                 target_recovered = self.tf_buffer.transform(
-                    target_msg, 
-                    'base_link', 
-                    timeout=transform_timeout
+                    target_msg, 'base_link', timeout=transform_timeout
                 )
-                
                 return np.array([
                     target_recovered.pose.position.x, 
                     target_recovered.pose.position.y
                 ])
-
             except (LookupException, ConnectivityException, ExtrapolationException) as e:
                 self.get_logger().warn(f"Transform Error: {e}")
                 return None
@@ -395,8 +394,7 @@ class MPCController(Node):
 
     def run_mpc(self):
         target = self.get_target_for_mpc()
-        if target is None:
-            return 0.0, 0.0, []
+        if target is None: return 0.0, 0.0, []
 
         obstacles_snapshot = self.obstacles_local.copy()
         obstacles_snapshot[:, 0] += self.config.sensor_offset
@@ -449,7 +447,7 @@ class MPCController(Node):
             ),
             method='SLSQP', 
             bounds=bounds, 
-            tol=1e-2 
+            tol=2e-2 
         )
         
         if res.success:
@@ -483,7 +481,6 @@ class MPCController(Node):
     def publish_obstacles(self):
         if len(self.obstacles_local) == 0: return
         marker = Marker()
-        
         marker.header.frame_id = self.sensor_frame_id 
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "obstacles"
@@ -492,10 +489,7 @@ class MPCController(Node):
         marker.action = Marker.ADD
         marker.scale.x = 0.05
         marker.scale.y = 0.05
-        marker.color.r = 0.0;
-        marker.color.g = 0.0;
-        marker.color.b = 1.0;
-        marker.color.a = 1.0
+        marker.color.r = 0.0; marker.color.g = 0.0; marker.color.b = 1.0; marker.color.a = 1.0
         
         if self.obstacles_local.shape[0] > 0:
             for obs in self.obstacles_local:
@@ -503,7 +497,6 @@ class MPCController(Node):
                 p.x = float(obs[0])
                 p.y = float(obs[1])
                 marker.points.append(p)
-        
         self.obs_pub.publish(marker)
         
     def publish_robot_radius(self):
@@ -522,29 +515,24 @@ class MPCController(Node):
         marker.scale.x = diameter
         marker.scale.y = diameter
         marker.scale.z = 0.05
-        marker.color.r = 0.0
-        marker.color.g = 1.0
-        marker.color.b = 1.0
-        marker.color.a = 0.3
+        marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 1.0; marker.color.a = 0.3
         self.robot_radius_pub.publish(marker)
 
     def publish_target_marker(self):
-        if self.target_odom is None: 
-            return
-        
+        if self.target_pose_in_odom is None: return
         marker = Marker()
-        marker.header.frame_id = "odom"
+        # ★修正: 確実に odom 座標系で表示
+        marker.header.frame_id = "odom" 
         marker.header.stamp = self.get_clock().now().to_msg()
-        
         marker.ns = "mpc_target"
         marker.id = 0
         marker.type = Marker.SPHERE
         marker.action = Marker.ADD
         
-        marker.pose.position.x = self.target_odom.pose.position.x
-        marker.pose.position.y = self.target_odom.pose.position.y
+        # 保存しておいた odom 座標を使用
+        marker.pose.position.x = self.target_pose_in_odom.pose.position.x
+        marker.pose.position.y = self.target_pose_in_odom.pose.position.y
         marker.pose.position.z = 0.5 
-        
         marker.scale.x = 0.3
         marker.scale.y = 0.3
         marker.scale.z = 0.3
@@ -552,18 +540,12 @@ class MPCController(Node):
         elapsed = 0.0
         if self.last_target_time is not None:
             elapsed = (self.get_clock().now() - self.last_target_time).nanoseconds / 1e9
-        
         is_lost = self.is_tracker_lost or (elapsed > self.config.lost_timeout)
         
         if is_lost:
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
+            marker.color.r = 1.0; marker.color.g = 0.0; marker.color.b = 0.0
         else:
-            marker.color.r = 0.0
-            marker.color.g = 1.0
-            marker.color.b = 0.0
-            
+            marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0
         marker.color.a = 1.0
         self.target_marker_pub.publish(marker)
 
@@ -581,10 +563,8 @@ class MPCController(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MPCController()
-    
     executor = MultiThreadedExecutor()
     executor.add_node(node)
-    
     try:
         executor.spin()
     except KeyboardInterrupt:
