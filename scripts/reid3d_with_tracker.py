@@ -34,7 +34,7 @@ import ros2_numpy as rnp
 # JIT Functions (Fastmath Enabled)
 # ==========================================
 
-@jit(nopython=True, cache=True, fastmath=True)
+@jit(nopython=True, cache=True, fastmath=True, nogil=True)
 def pf_predict_jit(particles, dt, process_noise_pos, process_noise_vel):
     num = particles.shape[0]
     noise_pos = np.random.randn(num, 2) * process_noise_pos
@@ -48,7 +48,7 @@ def pf_predict_jit(particles, dt, process_noise_pos, process_noise_vel):
     particles[:, 5] *= 0.5
     return particles
 
-@jit(nopython=True, cache=True, fastmath=True)
+@jit(nopython=True, cache=True, fastmath=True, nogil=True)
 def pf_update_jit(particles, weights, det_pos, det_sim, cov_inv, std_z, sim_thresh):
     N_particles = particles.shape[0]
     N_dets = det_pos.shape[0]
@@ -97,7 +97,7 @@ def pf_update_jit(particles, weights, det_pos, det_sim, cov_inv, std_z, sim_thre
 
     return weights
 
-@jit(nopython=True, cache=True, fastmath=True)
+@jit(nopython=True, cache=True, fastmath=True, nogil=True)
 def preprocess_math_jit(raw_points, min_points, pca_wall_thresh, pca_ratio_thresh, pca_radial_thresh, norm_num_points):
     n = raw_points.shape[0]
     if n < min_points:
@@ -427,6 +427,24 @@ class Candidate:
         mean_feature = torch.mean(gallery_tensor, dim=0)
         mean_feature = F.normalize(mean_feature.unsqueeze(0), p=2, dim=1).squeeze(0)
         self.cached_mean_feature = mean_feature
+        
+    def compute_max_similarity(self, query_feat_gpu):
+        """ 
+        query_feat_gpu: (1, 1024) のGPU Tensor
+                  戻り値: ギャラリー内で最も高い類似度 (float)
+        """
+        if len(self.feature_gallery) == 0: return 0.0
+        
+        # ギャラリー(CPUにあるリスト)を1つのTensorにまとめてGPUに送る
+        # (頻繁に行うと重いが、ターゲット1人分なら許容範囲)
+        gallery_tensor = torch.stack(list(self.feature_gallery)).to(query_feat_gpu.device).float()
+        
+        # 行列積: (1, 1024) x (1024, N) -> (1, N)
+        sim_matrix = torch.mm(query_feat_gpu, gallery_tensor.T)
+        
+        # 最大値を取得
+        max_sim = torch.max(sim_matrix).item()
+        return max_sim
 
 # ==========================================
 # ROS Node
@@ -501,7 +519,10 @@ class PersonTrackerClickInitNode(Node):
         }
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        torch.set_num_threads(4)
+        
+        # ★追加: PyTorchのCPUスレッド数を1に制限 (Trackerへの干渉を防ぐ)
+        torch.set_num_threads(1)
+        
         self.net = self._load_model()
         self.get_logger().info(f'Model Loaded on {self.device}')
 
@@ -583,90 +604,87 @@ class PersonTrackerClickInitNode(Node):
         try:
             feature = self.extract_feature_single(points_seq)
             if feature is None: return
+            
             with self.reid_lock:
                 feat_cpu = feature.cpu()
                 if mode == "INIT":
                     self.registered_feature = feat_cpu
-                    target_cand.update_feature_gallery(feat_cpu)
+                    target_cand.update_feature_gallery(feat_cpu) # 最初の1つを登録
                     target_cand.last_sim = 1.0 
                     self.feature_locked = True
                     self.state = "TRACKING"
+                
                 elif mode == "UPDATE":
                     if self.target_candidate and self.target_candidate.id == target_cand.id:
-                        mean_feat, _ = target_cand.get_feature_distribution()
-                        sim = 0.0
-                        if len(target_cand.feature_gallery) < 10:
-                             sim = torch.dot(feature, self.registered_feature.to(self.device).float()).item()
-                        elif mean_feat is not None:
-                             # 既にCPUキャッシュにある平均特徴量をGPUに送るだけ（1つだけ）
-                             sim = torch.dot(feature, mean_feat.to(self.device).float()).item()
+                        # ★変更: ギャラリー全体との最大類似度を計算
+                        # featureは (1024,) なので unsqueeze(0) で (1, 1024) にする
+                        sim = target_cand.compute_max_similarity(feature.unsqueeze(0))
+                        
                         target_cand.last_sim = sim
-                        if sim > 0.7: target_cand.update_feature_gallery(feat_cpu)
+                        
+                        # ★変更: 0.9以上なら「本人」とみなしてギャラリーに追加
+                        if sim > 0.9: 
+                            target_cand.update_feature_gallery(feat_cpu)
+                            
         except Exception as e: self.get_logger().error(f"ReID Err: {e}")
         finally: self.is_reid_running = False
 
     def async_recovery_worker(self, snapshot_candidates):
         try:
-            # ★修正: バッチサイズを1から8に増加（GPU効率化）
-            BATCH_SIZE = 1
+            BATCH_SIZE = 4 # 少しまとめて処理
             
-            reg_feat = self.registered_feature.to(self.device).float()
-            if reg_feat.dim() == 1: reg_feat = reg_feat.unsqueeze(0)
-
-            target_feat = reg_feat 
-            
-            if self.target_candidate:
-                # ★修正: キャッシュされた平均特徴量を直接使う（100個のリストをGPUに送らない）
-                mean_feat, _ = self.target_candidate.get_feature_distribution()
-                
-                if mean_feat is not None:
-                    # mean_featは1x1024のTensor (CPU)
-                    mean_feat_gpu = mean_feat.to(self.device).float()
-                    
-                    alpha = 0.5
-                    mixed_feat = (alpha * reg_feat) + ((1 - alpha) * mean_feat_gpu)
-                    target_feat = F.normalize(mixed_feat, p=2, dim=1)
+            # ★変更: ターゲットのギャラリー全体をGPUテンソル化
+            target_gallery = None
+            if self.target_candidate and len(self.target_candidate.feature_gallery) > 0:
+                target_gallery = torch.stack(list(self.target_candidate.feature_gallery)).to(self.device).float()
+            elif self.registered_feature is not None:
+                # 初期特徴量しかない場合
+                target_gallery = self.registered_feature.to(self.device).float()
+                if target_gallery.dim() == 1: target_gallery = target_gallery.unsqueeze(0)
 
             found_match = False
             best_match_info = None
+            # ★追加: 最も高いスコアを記録する変数
+            current_best_sim = 0.0
 
             for i in range(0, len(snapshot_candidates), BATCH_SIZE):
                 batch_cands = snapshot_candidates[i : i + BATCH_SIZE]
                 batch_input = [c['queue'] for c in batch_cands]
-                features = self.extract_features_batch(batch_input)
+                features = self.extract_features_batch(batch_input) # (Batch, 1024)
                 
-                if features is not None:
-                    sim_matrix = torch.mm(features, target_feat.T)
-                    sim_scores = sim_matrix.flatten().cpu().numpy()
+                if features is not None and target_gallery is not None:
+                    # ★変更: (Batch, 1024) x (1024, N_Gallery) -> (Batch, N_Gallery)
+                    sim_matrix = torch.mm(features, target_gallery.T)
+                    
+                    # 各候補について「ギャラリーの中で一番似ているスコア」を取る -> (Batch,)
+                    max_sims_per_cand, _ = torch.max(sim_matrix, dim=1)
+                    sim_scores = max_sims_per_cand.cpu().numpy()
                     
                     if len(sim_scores) > 0:
-                        best_idx_local = np.argmax(sim_scores)
-                        best_sim = float(sim_scores[best_idx_local])
+                        # バッチの中で一番似ている候補を探す
+                        idx_in_batch = np.argmax(sim_scores)
+                        score = float(sim_scores[idx_in_batch])
                         
-                        if best_sim > self.params['reid_sim_thresh']:
+                        # ★変更: 0.9を超え、かつ今までで一番高ければ記録
+                        if score > 0.9 and score > current_best_sim:
+                            current_best_sim = score
                             found_match = True
-                            best_match_info = (batch_cands[best_idx_local]['id'], best_sim)
-                            break
+                            best_match_info = (batch_cands[idx_in_batch]['id'], score)
                 
-                # ★重要修正: empty_cache()を削除！
-                # これが最大の遅延原因でした。PyTorchのメモリアロケータに任せます。
-                del features, batch_input
+                # GIL解放のためのスリープ (シングルノードの場合重要)
+                time.sleep(0.005) 
             
             if found_match and best_match_info:
                 cid, sim = best_match_info
+                # ... (以下、ターゲット入れ替え処理はそのまま) ...
                 if cid in self.candidates:
                     cand = self.candidates[cid]
                     self.get_logger().info(f">>> RECOVERY SUCCEEDED! New ID:{cid} (Sim: {sim:.2f})")
                     old_gallery = self.target_candidate.feature_gallery if self.target_candidate else None
-                    
-                    # 古いキャッシュも引き継ぐ
-                    old_cached_mean = self.target_candidate.cached_mean_feature if self.target_candidate else None
-                    
                     self.target_candidate = cand
                     self.target_candidate.last_sim = sim
                     if old_gallery:
                         self.target_candidate.feature_gallery = old_gallery
-                        self.target_candidate.cached_mean_feature = old_cached_mean # キャッシュ引継ぎ
                     self.state = "TRACKING"
 
         except Exception as e:
