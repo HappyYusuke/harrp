@@ -601,7 +601,7 @@ class PersonTrackerClickInitNode(Node):
                              # 既にCPUキャッシュにある平均特徴量をGPUに送るだけ（1つだけ）
                              sim = torch.dot(feature, mean_feat.to(self.device).float()).item()
                         target_cand.last_sim = sim
-                        if sim > 0.6: target_cand.update_feature_gallery(feat_cpu)
+                        if sim > 0.7: target_cand.update_feature_gallery(feat_cpu)
         except Exception as e: self.get_logger().error(f"ReID Err: {e}")
         finally: self.is_reid_running = False
 
@@ -623,7 +623,7 @@ class PersonTrackerClickInitNode(Node):
                     # mean_featは1x1024のTensor (CPU)
                     mean_feat_gpu = mean_feat.to(self.device).float()
                     
-                    alpha = 0.3
+                    alpha = 0.5
                     mixed_feat = (alpha * reg_feat) + ((1 - alpha) * mean_feat_gpu)
                     target_feat = F.normalize(mixed_feat, p=2, dim=1)
 
@@ -911,7 +911,7 @@ class PersonTrackerClickInitNode(Node):
         if self.target_candidate and self.target_candidate.id in self.candidates:
             cand = self.candidates[self.target_candidate.id]
             
-            LOST_THRESH = 0.7
+            LOST_THRESH = 0.8
             if self.feature_locked and cand.last_sim < LOST_THRESH and cand.last_sim > 0.001:
                 target_found = False
                 self.get_logger().warn(f"Force LOST: Sim {cand.last_sim:.2f} < {LOST_THRESH}")
@@ -937,7 +937,7 @@ class PersonTrackerClickInitNode(Node):
             if self.registered_feature is not None and not self.is_recovery_running:
                 snapshot_candidates = []
                 for cid, cand in self.candidates.items():
-                    if len(cand.queue) >= 3: 
+                    if len(cand.queue) >= 2: 
                         snapshot_candidates.append({'id': cid, 'queue': list(cand.queue)})
                 
                 if snapshot_candidates:
