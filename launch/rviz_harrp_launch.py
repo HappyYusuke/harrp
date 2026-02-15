@@ -53,25 +53,25 @@ def generate_launch_description():
             ],
         ),
 
-        #Node(
-        #    package='harrp',
-        #    executable='mpc_controller.py',
-        #    name='mpc_controller',
-        #    namespace=namespace,
-        #    output='screen',
-        #    parameters=[mpc_config],
-        #    remappings=[
-        #        # ロボット制御用トピック
-        #        ('/cmd_vel', '/kachaka/manual_control/cmd_vel'),
-        #        # オドメトリ購読用トピック
-        #        ('/odom', odom_topic_name),
-        #        # 3D LiDAR購読用トピック
-        #        ('/livox/lidar', '/livox/lidar'),
-        #        # tf用
-        #        ('tf', '/tf'),
-        #        ('tf_static', '/tf_static'),
-        #    ],
-        #),
+        Node(
+            package='harrp',
+            executable='mpc_controller.py',
+            name='mpc_controller',
+            namespace=namespace,
+            output='screen',
+            parameters=[mpc_config],
+            remappings=[
+                # ロボット制御用トピック
+                ('/cmd_vel', '/kachaka/manual_control/cmd_vel'),
+                # オドメトリ購読用トピック
+                ('/odom', odom_topic_name),
+                # 3D LiDAR購読用トピック
+                ('/livox/lidar', '/livox/lidar'),
+                # tf用
+                ('tf', '/tf'),
+                ('tf_static', '/tf_static'),
+            ],
+        ),
 
         Node(
             package='harrp',

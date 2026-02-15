@@ -2,7 +2,6 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Twist, PoseStamped, Point, TransformStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import PointCloud2
@@ -14,105 +13,137 @@ import tf2_geometry_msgs
 
 import numpy as np
 import math
-from scipy.optimize import minimize
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
-from numba import jit
+from numba import jit, prange
 
 # ==========================================
-# JITコンパイル関数
+# JIT Functions (Fastmath + nogil + Parallel)
 # ==========================================
 
-@jit(nopython=True, cache=True, fastmath=True)
-def predict_next_state_jit(state, v, w, dt):
-    x, y, yaw, _, _ = state
-    x += v * np.cos(yaw) * dt
-    y += v * np.sin(yaw) * dt
-    yaw += w * dt
-    if yaw > np.pi:
-        yaw -= 2 * np.pi
-    elif yaw < -np.pi:
-        yaw += 2 * np.pi
-    return np.array([x, y, yaw, v, w])
-
-@jit(nopython=True, cache=True, fastmath=True)
-def mpc_cost_jit(u_flat, current_state, target, obstacles, 
-                 horizon, dt, 
-                 w_dist, w_heading, w_vel, w_obs, 
-                 max_speed, robot_radius):
-    
-    cost = 0.0
-    curr_state = current_state.copy()
-    u = u_flat.reshape((horizon, 2))
-    
-    robot_radius_sq = robot_radius ** 2
-    collision_thresh_sq = (robot_radius + 0.15) ** 2
-    num_obs = len(obstacles)
+@jit(nopython=True, cache=True, fastmath=True, nogil=True)
+def predict_sequence_jit(state, v_seq, w_seq, dt):
+    horizon = len(v_seq)
+    traj = np.zeros((horizon, 5), dtype=np.float64)
+    curr_x, curr_y, curr_yaw = state[0], state[1], state[2]
     
     for i in range(horizon):
-        v = u[i, 0]
-        w = u[i, 1]
-        
-        curr_state = predict_next_state_jit(curr_state, v, w, dt)
-        px = curr_state[0]
-        py = curr_state[1]
-        pyaw = curr_state[2]
-        
-        # --- ゴール到達コスト ---
-        dx = target[0] - px
-        dy = target[1] - py
-        dist_sq = dx*dx + dy*dy
-        cost += w_dist * np.sqrt(dist_sq)
-        
-        # --- 向きのコスト ---
-        target_yaw = np.arctan2(dy, dx)
-        yaw_diff = np.abs(target_yaw - pyaw)
-        if yaw_diff > np.pi:
-            yaw_diff = 2 * np.pi - yaw_diff
-        cost += w_heading * yaw_diff
-        
-        # --- 速度維持コスト ---
-        target_v = max_speed if dist_sq > 1.0 else 0.0
-        cost += w_vel * np.abs(target_v - v)
-        
-        # --- 障害物回避コスト ---
-        if num_obs > 0:
-            min_obs_dist_sq = 10000.0
-            for j in range(num_obs):
-                ox = obstacles[j, 0]
-                oy = obstacles[j, 1]
-                d_sq = (ox - px)**2 + (oy - py)**2
-                if d_sq < min_obs_dist_sq:
-                    min_obs_dist_sq = d_sq
+        v = v_seq[i]; w = w_seq[i]
+        curr_x += v * np.cos(curr_yaw) * dt
+        curr_y += v * np.sin(curr_yaw) * dt
+        curr_yaw += w * dt
+        if curr_yaw > np.pi: curr_yaw -= 2 * np.pi
+        elif curr_yaw < -np.pi: curr_yaw += 2 * np.pi
+        traj[i, 0] = curr_x; traj[i, 1] = curr_y; traj[i, 2] = curr_yaw
+        traj[i, 3] = v; traj[i, 4] = w
+    return traj
 
-            if min_obs_dist_sq < collision_thresh_sq:
-                min_obs_dist = np.sqrt(min_obs_dist_sq)
-                if min_obs_dist < robot_radius:
-                    cost += w_obs * (1.0 / (min_obs_dist + 0.001)) * 100.0
-                else:
-                    cost += w_obs * (1.0 / min_obs_dist)
-                
-    return cost
-
-@jit(nopython=True, cache=True, fastmath=True)
-def process_lidar_jit(xyz, sensor_offset, robot_radius, max_points):
-    x_in_base = xyz[:, 0] + sensor_offset
-    y_in_base = xyz[:, 1]
+@jit(nopython=True, cache=True, fastmath=True, nogil=True, parallel=True)
+def evaluate_samples_jit(samples_v, samples_w, current_state, target, obstacles, 
+                         dt, w_dist, w_heading, w_vel, w_obs, w_smooth,
+                         max_speed, robot_radius):
+    num_samples = samples_v.shape[0]
+    horizon = samples_v.shape[1]
+    costs = np.zeros(num_samples, dtype=np.float64)
     
-    dists_sq = x_in_base**2 + y_in_base**2
     robot_radius_sq = robot_radius ** 2
-    max_dist_sq = 5.0 ** 2 
+    collision_dist_sq = (robot_radius + 0.15) ** 2 
+    num_obs = len(obstacles)
     
-    mask = (dists_sq > robot_radius_sq) & (dists_sq < max_dist_sq)
-    valid_xyz = xyz[mask]
-    num_valid = len(valid_xyz)
+    # 現在の速度・角速度 (平滑化用)
+    curr_v = current_state[3]
+    curr_w = current_state[4]
+
+    for k in prange(num_samples):
+        cost = 0.0
+        cx, cy, cyaw = current_state[0], current_state[1], current_state[2]
+        last_v = curr_v
+        last_w = curr_w
+        collision = False
+        
+        for t in range(horizon):
+            if collision:
+                cost += 10000.0
+                continue
+
+            v = samples_v[k, t]
+            w = samples_w[k, t]
+            
+            # --- モデル更新 ---
+            cx += v * np.cos(cyaw) * dt
+            cy += v * np.sin(cyaw) * dt
+            cyaw += w * dt
+            
+            # --- コスト計算 ---
+            dx = target[0] - cx
+            dy = target[1] - cy
+            dist_sq = dx*dx + dy*dy
+            
+            # 1. 距離コスト (ゴールに近づくことを推奨)
+            cost += w_dist * np.sqrt(dist_sq)
+            
+            # 2. 向きコスト
+            target_yaw = np.arctan2(dy, dx)
+            yaw_diff = np.abs(target_yaw - cyaw)
+            if yaw_diff > np.pi: yaw_diff = 2*np.pi - yaw_diff
+            cost += w_heading * yaw_diff
+
+            # 3. 速度コスト (なるべく最高速度で)
+            # ゴールまで0.5m以上なら最高速度、近ければ減速
+            target_v = max_speed if dist_sq > 0.25 else 0.0
+            cost += w_vel * np.abs(target_v - v)
+            
+            # 4. 平滑化コスト (急激な変化を抑制 ★重要)
+            # これを入れると左右の振動が減る
+            cost += w_smooth * (np.abs(v - last_v) + np.abs(w - last_w))
+            last_v = v
+            last_w = w
+
+            # 5. 障害物コスト
+            if num_obs > 0:
+                min_d_sq = 1000.0
+                for o in range(num_obs):
+                    odx = obstacles[o, 0] - cx
+                    ody = obstacles[o, 1] - cy
+                    d_sq = odx*odx + ody*ody
+                    if d_sq < min_d_sq: min_d_sq = d_sq
+                    if d_sq < robot_radius_sq:
+                        collision = True
+                        break
+                
+                if collision:
+                    cost += w_obs * 10000.0
+                elif min_d_sq < collision_dist_sq:
+                    d_val = np.sqrt(min_d_sq)
+                    cost += w_obs * (1.0 / d_val) * 10.0
+        
+        costs[k] = cost
+
+    return np.argmin(costs)
+
+@jit(nopython=True, cache=True, fastmath=True, nogil=True)
+def process_lidar_jit(xyz, sensor_offset, robot_radius, min_height, max_height):
+    num_in = xyz.shape[0]
+    temp_obs = np.zeros((num_in, 2), dtype=np.float64)
+    count = 0
+    robot_radius_sq = robot_radius ** 2
+    max_dist_limit_sq = 3.0 ** 2 
     
-    if num_valid > max_points:
-        step = num_valid // max_points
-        downsampled = valid_xyz[::step]
-        return downsampled[:max_points]
-    else:
-        return valid_xyz
+    for i in range(num_in):
+        x = xyz[i, 0]; y = xyz[i, 1]; z = xyz[i, 2]
+        if np.isnan(x) or np.isnan(y) or np.isnan(z): continue
+        
+        # 高さフィルタ
+        if z < min_height or z > max_height: continue
+            
+        bx = x + sensor_offset; by = y
+        dist_sq = bx*bx + by*by
+        
+        if dist_sq > robot_radius_sq and dist_sq < max_dist_limit_sq:
+            temp_obs[count, 0] = bx; temp_obs[count, 1] = by
+            count += 1
+            
+    return temp_obs[:count]
 
 # ==========================================
 
@@ -122,22 +153,27 @@ class MPCConfig:
         self.min_speed = 0.0
         self.max_yaw_rate = 1.0
         self.max_accel = 1.0
-        self.max_dyaw_rate = 5.0 
         self.dt = 0.1
-        self.horizon = 20
-        self.w_dist = 0.3
-        self.w_heading = 0.2
-        self.w_vel = 0.3
-        self.w_obs = 0.2
+        self.horizon = 15      
+        self.num_samples = 150 
+        
+        # --- パラメータ調整 ---
+        self.w_dist = 0.8      # ゴールへ向かう力を強化 (0.5 -> 0.8)
+        self.w_heading = 0.3   # 向きの重み
+        self.w_vel = 0.2       # 速度維持
+        self.w_obs = 0.8       # 障害物回避
+        self.w_smooth = 0.3    # ★追加: 動きの滑らかさ (振動抑制)
+        
         self.robot_radius = 0.23
-        self.goal_tolerance = 0.8
+        self.goal_tolerance = 0.6 
         self.sensor_offset = 0.156
         self.turn_kp = 0.5
         self.turn_kd = 0.2
         self.turn_yaw_tolerance = 0.1
-        self.min_height = -0.05
+        
+        # ★修正: 床誤検知対策
+        self.min_height = 0.1  # 0.05 -> 0.1 (10cm以下の点は無視)
         self.max_height = 0.1
-        self.min_dist = 0.2
         self.lost_timeout = 1.0
 
 class MPCController(Node):
@@ -146,124 +182,62 @@ class MPCController(Node):
         self.config = MPCConfig()
         self.cb_group = ReentrantCallbackGroup()
 
-        self.declare_parameters(
-            namespace='',
-            parameters=[
-                ('max_speed', self.config.max_speed),
-                ('min_speed', self.config.min_speed),
-                ('max_yaw_rate', self.config.max_yaw_rate),
-                ('max_accel', self.config.max_accel),
-                ('max_dyaw_rate', self.config.max_dyaw_rate),
-                ('dt', self.config.dt),
-                ('horizon', self.config.horizon),
-                ('w_dist', self.config.w_dist),
-                ('w_heading', self.config.w_heading),
-                ('w_vel', self.config.w_vel),
-                ('w_obs', self.config.w_obs),
-                ('robot_radius', self.config.robot_radius),
-                ('goal_tolerance', self.config.goal_tolerance),
-                ('sensor_offset', self.config.sensor_offset),
-                ('turn_kp', self.config.turn_kp),
-                ('turn_kd', self.config.turn_kd),
-                ('turn_yaw_tolerance', self.config.turn_yaw_tolerance),
-                ('lost_timeout', self.config.lost_timeout),
-            ]
-        )
+        self.declare_parameters(namespace='', parameters=[
+            ('max_speed', self.config.max_speed), ('min_speed', self.config.min_speed),
+            ('max_yaw_rate', self.config.max_yaw_rate), ('dt', self.config.dt),
+            ('horizon', self.config.horizon), ('w_dist', self.config.w_dist),
+            ('w_heading', self.config.w_heading), ('w_vel', self.config.w_vel),
+            ('w_obs', self.config.w_obs), ('w_smooth', self.config.w_smooth),
+            ('robot_radius', self.config.robot_radius),
+            ('sensor_offset', self.config.sensor_offset), ('lost_timeout', self.config.lost_timeout),
+        ])
         self.update_config_from_params()
-        self.add_on_set_parameters_callback(self.parameter_callback)
 
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_pub = self.create_publisher(Path, 'mpc/predict_path', 10)
         self.obs_pub = self.create_publisher(Marker, 'mpc/obstacles', 10)
-        self.robot_radius_pub = self.create_publisher(Marker, 'mpc/robot_radius', 10)
         self.target_marker_pub = self.create_publisher(Marker, 'mpc/target_debug', 10)
+        self.robot_radius_pub = self.create_publisher(Marker, 'mpc/robot_radius', 10)
         
-        qos_profile = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
+        qos_profile = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
 
-        self.create_subscription(
-            Odometry, '/kachaka/odometry/odometry', self.odom_callback, qos_profile, 
-            callback_group=self.cb_group
-        )
-        self.create_subscription(
-            PoseStamped, 'tracker/target_pose', self.target_callback, 10, 
-            callback_group=self.cb_group
-        )
-        self.create_subscription(
-            PointCloud2, '/livox/lidar', self.lidar_callback, 10, 
-            callback_group=self.cb_group
-        )
-        self.create_subscription(
-            String, 'tracker/target_status', self.status_callback, 10,
-            callback_group=self.cb_group
-        )
+        self.create_subscription(Odometry, '/kachaka/odometry/odometry', self.odom_callback, qos_profile, callback_group=self.cb_group)
+        self.create_subscription(PoseStamped, 'tracker/target_pose', self.target_callback, 10, callback_group=self.cb_group)
+        self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_callback, 10, callback_group=self.cb_group)
+        self.create_subscription(String, 'tracker/target_status', self.status_callback, 10, callback_group=self.cb_group)
         
-        self.current_vel = 0.0
-        self.current_yaw_rate = 0.0
-        
+        self.current_state = np.zeros(5) 
         self.target_local = None 
-        # 変数名を target_odom から target_pose_in_odom に変更（混乱防止）
         self.target_pose_in_odom = None  
         self.last_target_time = None
-        self.sensor_frame_id = "livox_frame"
         self.is_tracker_lost = False
-        
         self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
+        self.sensor_frame_id = "livox_frame"
         
-        self.prev_solution = np.zeros(self.config.horizon * 2)
+        self.prev_v_seq = np.zeros(self.config.horizon)
+        self.prev_w_seq = np.zeros(self.config.horizon)
         self.prev_yaw_error = None
         
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
         
-        self.timer = self.create_timer(
-            0.1, self.control_loop, 
-            callback_group=self.cb_group
-        )
+        self.timer = self.create_timer(0.1, self.control_loop, callback_group=self.cb_group)
 
     def update_config_from_params(self):
         self.config.max_speed = self.get_parameter('max_speed').value
-        self.config.min_speed = self.get_parameter('min_speed').value
         self.config.max_yaw_rate = self.get_parameter('max_yaw_rate').value
-        self.config.max_accel = self.get_parameter('max_accel').value
-        self.config.max_dyaw_rate = self.get_parameter('max_dyaw_rate').value
-        self.config.dt = self.get_parameter('dt').value
         self.config.horizon = self.get_parameter('horizon').value
-        self.config.w_dist = self.get_parameter('w_dist').value
-        self.config.w_heading = self.get_parameter('w_heading').value
-        self.config.w_vel = self.get_parameter('w_vel').value
-        self.config.w_obs = self.get_parameter('w_obs').value
-        self.config.robot_radius = self.get_parameter('robot_radius').value
-        self.config.goal_tolerance = self.get_parameter('goal_tolerance').value
-        self.config.sensor_offset = self.get_parameter('sensor_offset').value
-        self.config.turn_kp = self.get_parameter('turn_kp').value
-        self.config.turn_kd = self.get_parameter('turn_kd').value
-        self.config.turn_yaw_tolerance = self.get_parameter('turn_yaw_tolerance').value
-        self.config.lost_timeout = self.get_parameter('lost_timeout').value
-
-    def parameter_callback(self, params):
-        horizon_changed = False
-        for param in params:
-            if hasattr(self.config, param.name):
-                setattr(self.config, param.name, param.value)
-                if param.name == 'horizon':
-                    horizon_changed = True
-        if horizon_changed:
-            self.prev_solution = np.zeros(self.config.horizon * 2)
-        return SetParametersResult(successful=True)
+        # w_smoothも更新可能にする
+        if self.has_parameter('w_smooth'):
+            self.config.w_smooth = self.get_parameter('w_smooth').value
 
     def odom_callback(self, msg):
-        self.current_vel = msg.twist.twist.linear.x
-        self.current_yaw_rate = msg.twist.twist.angular.z
-
+        self.current_state[3] = msg.twist.twist.linear.x
+        self.current_state[4] = msg.twist.twist.angular.z
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'odom'
-        t.child_frame_id = 'base_link'
+        t.header.frame_id = 'odom'; t.child_frame_id = 'base_link'
         t.transform.translation.x = msg.pose.pose.position.x
         t.transform.translation.y = msg.pose.pose.position.y
         t.transform.translation.z = msg.pose.pose.position.z
@@ -271,307 +245,175 @@ class MPCController(Node):
         self.tf_broadcaster.sendTransform(t)
 
     def status_callback(self, msg):
-        if "LOST" in msg.data:
-            self.is_tracker_lost = True
-        else:
-            self.is_tracker_lost = False
+        self.is_tracker_lost = "LOST" in msg.data
 
     def target_callback(self, msg):
         self.last_target_time = self.get_clock().now()
         self.is_tracker_lost = False
-
         try:
-            # ★修正: ここで受け取ったメッセージ（livox_frameなど）を、
-            # 即座に 'base_link' (制御用) と 'odom' (保存/表示用) の両方に変換する。
+            target_time = rclpy.time.Time()
+            msg_tmp = PoseStamped()
+            msg_tmp.header = msg.header
+            msg_tmp.header.stamp = target_time.to_msg()
+            msg_tmp.pose = msg.pose
             
-            # タイムスタンプのズレ防止のため、現在時刻(0)で再構築
-            target_msg_now = PoseStamped()
-            target_msg_now.header.frame_id = msg.header.frame_id
-            target_msg_now.header.stamp = rclpy.time.Time().to_msg() 
-            target_msg_now.pose = msg.pose
-            
-            transform_timeout = rclpy.duration.Duration(seconds=0.1)
-            
-            # 1. MPC制御用: base_link への変換
-            target_in_base_link = self.tf_buffer.transform(
-                target_msg_now, 'base_link', timeout=transform_timeout
-            )
-            self.target_local = np.array([
-                target_in_base_link.pose.position.x, 
-                target_in_base_link.pose.position.y
-            ])
+            target_in_base = self.tf_buffer.transform(msg_tmp, 'base_link', timeout=rclpy.duration.Duration(seconds=0.1))
+            self.target_local = np.array([target_in_base.pose.position.x, target_in_base.pose.position.y])
 
-            # 2. 保存・表示・ロスト復帰用: odom への変換 (★重要)
-            # これを保存しておけば、マーカー表示やロスト時に正しい世界座標を使える
-            self.target_pose_in_odom = self.tf_buffer.transform(
-                target_msg_now, 'odom', timeout=transform_timeout
-            )
-
-        except (LookupException, ConnectivityException, ExtrapolationException) as e:
-            self.get_logger().warn(f"Transform Error in callback: {e}")
+            self.target_pose_in_odom = self.tf_buffer.transform(msg_tmp, 'odom', timeout=rclpy.duration.Duration(seconds=0.1))
+        except (LookupException, ConnectivityException, ExtrapolationException): pass
 
     def lidar_callback(self, msg):
         self.sensor_frame_id = msg.header.frame_id
         try:
             point_step = msg.point_step
-            raw_uint8 = np.frombuffer(msg.data, dtype=np.uint8)
-            if len(raw_uint8) % point_step != 0: return
-            
-            num_points = len(raw_uint8) // point_step
-            points_data = raw_uint8.reshape(num_points, point_step)
-            
-            x_bytes = points_data[:, 0:4].view(dtype=np.float32).reshape(-1)
-            y_bytes = points_data[:, 4:8].view(dtype=np.float32).reshape(-1)
-            z_bytes = points_data[:, 8:12].view(dtype=np.float32).reshape(-1)
-            
-            xyz = np.stack((x_bytes, y_bytes, z_bytes), axis=1)
-            
-            mask_valid = np.isfinite(xyz).all(axis=1)
-            xyz = xyz[mask_valid]
-            
-            if xyz.shape[0] == 0:
-                self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
-                return
+            raw_data = np.frombuffer(msg.data, dtype=np.uint8)
+            num_points = len(raw_data) // point_step
+            if num_points == 0: return
 
-            mask_z = (xyz[:, 2] > self.config.min_height) & (xyz[:, 2] < self.config.max_height)
-            xyz = xyz[mask_z]
-            
-            MAX_OBSTACLES = 1000
+            float_view = np.frombuffer(msg.data, dtype=np.float32)
+            xyz = np.empty((num_points, 3), dtype=np.float32)
+            float_step = point_step // 4
+            xyz[:, 0] = float_view[0::float_step][:num_points]
+            xyz[:, 1] = float_view[1::float_step][:num_points]
+            xyz[:, 2] = float_view[2::float_step][:num_points]
             
             self.obstacles_local = process_lidar_jit(
-                xyz, 
-                self.config.sensor_offset, 
-                self.config.robot_radius, 
-                MAX_OBSTACLES
-            ).astype(np.float64)
-                
+                xyz.astype(np.float64), 
+                self.config.sensor_offset, self.config.robot_radius,
+                self.config.min_height, self.config.max_height
+            )
         except Exception as e:
-            self.get_logger().warn(f"Lidar Processing Error: {e}")
-            self.obstacles_local = np.zeros((0, 2), dtype=np.float64)
+            self.get_logger().debug(f"Lidar Error: {e}")
 
-    def get_target_for_mpc(self):
+    def get_target_pos(self):
         if self.last_target_time is None: return None
-
         elapsed = (self.get_clock().now() - self.last_target_time).nanoseconds / 1e9
-        is_lost_condition = self.is_tracker_lost or (elapsed > self.config.lost_timeout)
-        
-        if not is_lost_condition:
-            return self.target_local
-        else:
-            # ロスト時: 保存しておいた odom 座標（世界座標）を使用
-            if self.target_pose_in_odom is None: return None
-            
+        is_lost = self.is_tracker_lost or (elapsed > self.config.lost_timeout)
+        if not is_lost: return self.target_local
+        elif self.target_pose_in_odom is not None:
             try:
-                transform_timeout = rclpy.duration.Duration(seconds=0.1)
-                
-                # odom座標にあるターゲットを、現在の base_link から見た位置に再計算
-                target_msg = PoseStamped()
-                target_msg.header.frame_id = 'odom' # 確実にodom
-                target_msg.header.stamp = rclpy.time.Time().to_msg()
-                target_msg.pose = self.target_pose_in_odom.pose
+                tm = PoseStamped()
+                tm.header.frame_id = 'odom'; tm.header.stamp = rclpy.time.Time().to_msg()
+                tm.pose = self.target_pose_in_odom.pose
+                tb = self.tf_buffer.transform(tm, 'base_link', timeout=rclpy.duration.Duration(seconds=0.1))
+                return np.array([tb.pose.position.x, tb.pose.position.y])
+            except: return None
+        return None
 
-                target_recovered = self.tf_buffer.transform(
-                    target_msg, 'base_link', timeout=transform_timeout
-                )
-                return np.array([
-                    target_recovered.pose.position.x, 
-                    target_recovered.pose.position.y
-                ])
-            except (LookupException, ConnectivityException, ExtrapolationException) as e:
-                self.get_logger().warn(f"Transform Error: {e}")
-                return None
-            except AttributeError as e:
-                self.get_logger().warn(f"Data Type Error: {e}")
-                return None
-
-    def predict_next_state(self, state, v, w, dt):
-        x, y, yaw, _, _ = state
-        x += v * math.cos(yaw) * dt
-        y += v * math.sin(yaw) * dt
-        yaw += w * dt
-        yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
-        return np.array([x, y, yaw, v, w])
-
-    def run_mpc(self):
-        target = self.get_target_for_mpc()
-        if target is None: return 0.0, 0.0, []
-
-        obstacles_snapshot = self.obstacles_local.copy()
-        obstacles_snapshot[:, 0] += self.config.sensor_offset
-
-        dx = target[0]
-        dy = target[1]
-        dist = math.hypot(dx, dy)
-        target_yaw = math.atan2(dy, dx) 
-
-        # PD制御 (旋回)
-        if dist < self.config.goal_tolerance:
-            yaw_diff = target_yaw
-            while yaw_diff > math.pi: yaw_diff -= 2 * math.pi
-            while yaw_diff < -math.pi: yaw_diff += 2 * math.pi
-
-            if self.prev_yaw_error is None:
-                derivative = 0.0
-            else:
-                derivative = (yaw_diff - self.prev_yaw_error) / 0.1
-            self.prev_yaw_error = yaw_diff
-
-            if abs(yaw_diff) > self.config.turn_yaw_tolerance:
-                w_cmd = (self.config.turn_kp * yaw_diff) + (self.config.turn_kd * derivative)
-                w_cmd = max(min(w_cmd, self.config.max_yaw_rate), -self.config.max_yaw_rate)
-                return 0.0, w_cmd, []
-            else:
-                return 0.0, 0.0, []
-        else:
-            self.prev_yaw_error = None
-
-        # MPC
-        bounds = []
-        for _ in range(self.config.horizon):
-            bounds.append((self.config.min_speed, self.config.max_speed))
-            bounds.append((-self.config.max_yaw_rate, self.config.max_yaw_rate))
-
-        x0 = np.roll(self.prev_solution, -2)
-        x0[-2:] = 0.0
-
-        current_state = np.array([0.0, 0.0, 0.0, self.current_vel, self.current_yaw_rate], dtype=np.float64)
-
-        res = minimize(
-            mpc_cost_jit, 
-            x0, 
-            args=(
-                current_state, target, obstacles_snapshot, 
-                self.config.horizon, self.config.dt, 
-                self.config.w_dist, self.config.w_heading, self.config.w_vel, self.config.w_obs,
-                self.config.max_speed, self.config.robot_radius
-            ),
-            method='SLSQP', 
-            bounds=bounds, 
-            tol=2e-2 
+    def run_mpc_sampling(self, target):
+        H = self.config.horizon; N = self.config.num_samples
+        self.prev_v_seq = np.roll(self.prev_v_seq, -1); self.prev_v_seq[-1] = 0
+        self.prev_w_seq = np.roll(self.prev_w_seq, -1); self.prev_w_seq[-1] = 0
+        
+        # サンプリング時のノイズを少し減らして安定化
+        samples_v = self.prev_v_seq + np.random.normal(0, 0.2, (N, H))
+        samples_w = self.prev_w_seq + np.random.normal(0, 0.4, (N, H))
+        
+        samples_v = np.clip(samples_v, self.config.min_speed, self.config.max_speed)
+        samples_w = np.clip(samples_w, -self.config.max_yaw_rate, self.config.max_yaw_rate)
+        
+        obs_base = self.obstacles_local
+        sim_state = np.array([0.0, 0.0, 0.0, self.current_state[3], self.current_state[4]], dtype=np.float64)
+        
+        best_idx = evaluate_samples_jit(
+            samples_v, samples_w, sim_state, target, obs_base,
+            self.config.dt, self.config.w_dist, self.config.w_heading, self.config.w_vel, self.config.w_obs, self.config.w_smooth,
+            self.config.max_speed, self.config.robot_radius
         )
         
-        if res.success:
-            self.prev_solution = res.x
-            v_cmd = res.x[0]
-            w_cmd = res.x[1]
-            predict_path = []
+        best_v_seq = samples_v[best_idx]
+        best_w_seq = samples_w[best_idx]
+        self.prev_v_seq = best_v_seq
+        self.prev_w_seq = best_w_seq
+        
+        path_points = predict_sequence_jit(sim_state, best_v_seq, best_w_seq, self.config.dt)
+        return best_v_seq[0], best_w_seq[0], path_points
+
+    def control_loop(self):
+        self.publish_obstacles()
+        self.publish_target_marker()
+        self.publish_robot_radius()
+
+        target = self.get_target_pos()
+        if target is None:
+            self.cmd_vel_pub.publish(Twist())
+            self.publish_path([])
+            return
             
-            curr_state = current_state.copy()
-            u = res.x.reshape(self.config.horizon, 2)
-            for i in range(self.config.horizon):
-                curr_state = self.predict_next_state(curr_state, u[i][0], u[i][1], self.config.dt)
-                predict_path.append([curr_state[0], curr_state[1]])
-            return v_cmd, w_cmd, predict_path
-        else:
-            self.get_logger().warn("MPC Optimization Failed")
-            return 0.0, 0.0, []
+        dist = math.hypot(target[0], target[1])
+        if dist < 0.5:
+            yaw_diff = math.atan2(target[1], target[0])
+            while yaw_diff > math.pi: yaw_diff -= 2 * math.pi
+            while yaw_diff < -math.pi: yaw_diff += 2 * math.pi
+            twist = Twist()
+            if abs(yaw_diff) > self.config.turn_yaw_tolerance:
+                twist.angular.z = float(np.clip(yaw_diff * 1.5, -0.5, 0.5))
+            elif dist > 0.2:
+                twist.linear.x = float(np.clip(dist * 0.5, 0.0, 0.3))
+                twist.angular.z = float(np.clip(yaw_diff * 1.0, -0.3, 0.3))
+            self.cmd_vel_pub.publish(twist)
+            self.publish_path([])
+            return
+
+        v, w, path = self.run_mpc_sampling(target)
+        msg = Twist(); msg.linear.x = float(v); msg.angular.z = float(w)
+        self.cmd_vel_pub.publish(msg)
+        self.publish_path(path)
 
     def publish_path(self, trajectory):
-        if not trajectory: return
         path_msg = Path()
         path_msg.header.stamp = self.get_clock().now().to_msg()
-        path_msg.header.frame_id = "base_link" 
-        for point in trajectory:
+        path_msg.header.frame_id = "base_link"
+        for i in range(len(trajectory)):
             pose = PoseStamped()
-            pose.pose.position.x = point[0]
-            pose.pose.position.y = point[1]
+            pose.pose.position.x = trajectory[i, 0]
+            pose.pose.position.y = trajectory[i, 1]
             path_msg.poses.append(pose)
         self.path_pub.publish(path_msg)
-        
+
     def publish_obstacles(self):
         if len(self.obstacles_local) == 0: return
         marker = Marker()
-        marker.header.frame_id = self.sensor_frame_id 
+        marker.header.frame_id = "base_link"
         marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "obstacles"
-        marker.id = 0
-        marker.type = Marker.POINTS
-        marker.action = Marker.ADD
-        marker.scale.x = 0.05
-        marker.scale.y = 0.05
-        marker.color.r = 0.0; marker.color.g = 0.0; marker.color.b = 1.0; marker.color.a = 1.0
-        
-        if self.obstacles_local.shape[0] > 0:
-            for obs in self.obstacles_local:
-                p = Point()
-                p.x = float(obs[0])
-                p.y = float(obs[1])
-                marker.points.append(p)
+        marker.ns = "obstacles"; marker.id = 0; marker.type = Marker.POINTS; marker.action = Marker.ADD
+        marker.scale.x = 0.05; marker.scale.y = 0.05; marker.color.b = 1.0; marker.color.a = 1.0
+        for obs in self.obstacles_local:
+            p = Point(); p.x = float(obs[0]); p.y = float(obs[1])
+            marker.points.append(p)
         self.obs_pub.publish(marker)
         
     def publish_robot_radius(self):
         marker = Marker()
         marker.header.frame_id = "base_link"
         marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "safety_margin"
-        marker.id = 0
-        marker.type = Marker.CYLINDER
-        marker.action = Marker.ADD
-        marker.pose.position.x = 0.0
-        marker.pose.position.y = 0.0
-        marker.pose.position.z = 0.0
+        marker.ns = "safety_margin"; marker.id = 0; marker.type = Marker.CYLINDER; marker.action = Marker.ADD
         marker.pose.orientation.w = 1.0
         diameter = self.config.robot_radius * 2.0
-        marker.scale.x = diameter
-        marker.scale.y = diameter
-        marker.scale.z = 0.05
+        marker.scale.x = diameter; marker.scale.y = diameter; marker.scale.z = 0.05
         marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 1.0; marker.color.a = 0.3
         self.robot_radius_pub.publish(marker)
 
     def publish_target_marker(self):
         if self.target_pose_in_odom is None: return
         marker = Marker()
-        # ★修正: 確実に odom 座標系で表示
-        marker.header.frame_id = "odom" 
+        marker.header.frame_id = "odom"
         marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "mpc_target"
-        marker.id = 0
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        
-        # 保存しておいた odom 座標を使用
-        marker.pose.position.x = self.target_pose_in_odom.pose.position.x
-        marker.pose.position.y = self.target_pose_in_odom.pose.position.y
-        marker.pose.position.z = 0.5 
-        marker.scale.x = 0.3
-        marker.scale.y = 0.3
-        marker.scale.z = 0.3
-        
-        elapsed = 0.0
-        if self.last_target_time is not None:
-            elapsed = (self.get_clock().now() - self.last_target_time).nanoseconds / 1e9
-        is_lost = self.is_tracker_lost or (elapsed > self.config.lost_timeout)
-        
-        if is_lost:
-            marker.color.r = 1.0; marker.color.g = 0.0; marker.color.b = 0.0
-        else:
-            marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0
-        marker.color.a = 1.0
+        marker.ns = "mpc_target"; marker.id = 0; marker.type = Marker.SPHERE; marker.action = Marker.ADD
+        marker.pose = self.target_pose_in_odom.pose
+        marker.scale.x = 0.3; marker.scale.y = 0.3; marker.scale.z = 0.3
+        marker.color.g = 1.0; marker.color.a = 1.0
         self.target_marker_pub.publish(marker)
-
-    def control_loop(self):
-        v, w, path = self.run_mpc()
-        msg = Twist()
-        msg.linear.x = float(v)
-        msg.angular.z = float(w)
-        self.cmd_vel_pub.publish(msg)
-        self.publish_path(path)
-        self.publish_obstacles()
-        self.publish_robot_radius()
-        self.publish_target_marker()
 
 def main(args=None):
     rclpy.init(args=args)
     node = MPCController()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
-    try:
-        executor.spin()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    try: executor.spin()
+    except KeyboardInterrupt: pass
+    finally: node.destroy_node(); rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

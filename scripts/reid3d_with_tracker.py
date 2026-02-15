@@ -623,7 +623,7 @@ class PersonTrackerClickInitNode(Node):
                         target_cand.last_sim = sim
                         
                         # ★変更: 0.9以上なら「本人」とみなしてギャラリーに追加
-                        if sim > 0.9: 
+                        if sim > 0.8: 
                             target_cand.update_feature_gallery(feat_cpu)
                             
         except Exception as e: self.get_logger().error(f"ReID Err: {e}")
@@ -631,7 +631,7 @@ class PersonTrackerClickInitNode(Node):
 
     def async_recovery_worker(self, snapshot_candidates):
         try:
-            BATCH_SIZE = 4 # 少しまとめて処理
+            BATCH_SIZE = 1 # 少しまとめて処理
             
             # ★変更: ターゲットのギャラリー全体をGPUテンソル化
             target_gallery = None
@@ -666,7 +666,7 @@ class PersonTrackerClickInitNode(Node):
                         score = float(sim_scores[idx_in_batch])
                         
                         # ★変更: 0.9を超え、かつ今までで一番高ければ記録
-                        if score > 0.9 and score > current_best_sim:
+                        if score > 0.8 and score > current_best_sim:
                             current_best_sim = score
                             found_match = True
                             best_match_info = (batch_cands[idx_in_batch]['id'], score)
