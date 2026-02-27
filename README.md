@@ -18,6 +18,17 @@
 
 </br>
 
+## Requirements
+本リポジトリは以下環境でテストされました。
+
+* PC: Laptop
+* GPU: NVIDIA RTX 3070
+* VRAM: 8GB
+
+⚠️: ReID3DがRTX 4000シリーズで動作しなかったため、RTX 3000シリーズ以下での環境を推奨します。
+
+</br>
+
 # Installation
 HARRPは、以下2つのリポジトリ (図上部2つのDockerコンテナ) のインストールが完了すれば使用できます。
 
