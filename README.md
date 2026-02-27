@@ -148,6 +148,13 @@ network:
 
 </br>
 
+ファイルを元に設定を反映します。
+```bash
+sudo netplan apply
+```
+
+</br>
+
 ### `livox_ros_driver2`の設定ファイルを書き換えます。
 
 1. `./run-docker-containter.sh`でDockerを起動します。
@@ -204,10 +211,21 @@ ros2 launch pp_infer pp_infer_harrp_launch.py
 </br>
 
 ## HARRPを実行
-`docker_ReID3D2025`のコンテナ内で以下を実行。
+`docker_ReID3D2025`のコンテナ内で`terminator`を起動してください。
 ```bash
 terminator
+```
 
+`terminator`は以下の通りターミナルを分割できます。
+- ctrl+shift+oで上下分割
+- ctrl+shift+eで左右分割
+- ctrl+shift+nや+pで画面間移動
+- ctrl+shift+wで画面を一つ閉じる
+
+</br>
+
+以下コマンドを実行していき、ロボットの正面に人が立つと追従対象が登録され、追従が始まります。
+```bash
 # rviz2
 rviz2 -d ~/colcon_ws/src/harrp/rviz/harrp_kachaka.rviz
 
