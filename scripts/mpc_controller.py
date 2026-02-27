@@ -153,16 +153,16 @@ class MPCConfig:
         self.min_speed = 0.0
         self.max_yaw_rate = 1.0
         self.max_accel = 1.0
-        self.dt = 0.1
+        self.dt = 0.2
         self.horizon = 15      
         self.num_samples = 150 
         
         # --- パラメータ調整 ---
         self.w_dist = 0.8      # ゴールへ向かう力を強化 (0.5 -> 0.8)
         self.w_heading = 0.3   # 向きの重み
-        self.w_vel = 0.2       # 速度維持
+        self.w_vel = 0.4       # 速度維持
         self.w_obs = 0.8       # 障害物回避
-        self.w_smooth = 0.3    # ★追加: 動きの滑らかさ (振動抑制)
+        self.w_smooth = 0.5    # ★追加: 動きの滑らかさ (振動抑制)
         
         self.robot_radius = 0.23
         self.goal_tolerance = 0.6 
@@ -342,14 +342,14 @@ class MPCController(Node):
             return
             
         dist = math.hypot(target[0], target[1])
-        if dist < 0.5:
+        if dist < 1.0:
             yaw_diff = math.atan2(target[1], target[0])
             while yaw_diff > math.pi: yaw_diff -= 2 * math.pi
             while yaw_diff < -math.pi: yaw_diff += 2 * math.pi
             twist = Twist()
             if abs(yaw_diff) > self.config.turn_yaw_tolerance:
                 twist.angular.z = float(np.clip(yaw_diff * 1.5, -0.5, 0.5))
-            elif dist > 0.2:
+            elif dist > 1.0:
                 twist.linear.x = float(np.clip(dist * 0.5, 0.0, 0.3))
                 twist.angular.z = float(np.clip(yaw_diff * 1.0, -0.3, 0.3))
             self.cmd_vel_pub.publish(twist)
