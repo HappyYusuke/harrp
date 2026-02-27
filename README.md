@@ -16,6 +16,8 @@
 ### Demonstration Video
 👉 [【Demonstration Video】HARRP: Human-following Autonomous Robot System Using ReID3D and PointPillars.](https://youtu.be/31dsITqNGis)
 
+</br>
+
 # Installation
 HARRPは、以下2つのリポジトリ (図上部2つのDockerコンテナ) のインストールが完了すれば使用できます。
 
@@ -27,6 +29,8 @@ HARRPは、以下2つのリポジトリ (図上部2つのDockerコンテナ) の
 <p align="center">
   <img src=figs/Software_stack.png width=500>
 </p>
+
+</br>
 
 ## docker_ros2_tao_pintpillars
 リポジトリをクローンする
@@ -74,6 +78,8 @@ Docker Imageのロードが始まり、コンテナが起動するとプロン�
 ./setup.sh
 ```
 
+</br>
+
 ## docker_ReID3D2025
 リポジトリをクローンする。
 
@@ -114,8 +120,105 @@ unzip large_files_docker_ReID3D2025.zip
 
 # 重みファイルを移動
 mv large_files_docker_ReID3D2025/ckpt_best.pth ~/docker_ReID3D2025/home/ReID3D/reidnet/log
+```
 
 </br>
 
 # Usage
+MID-360を初めて接続する場合は以下の「MID-360と接続したい場合」を行ってください。
 
+<details>
+<summary>MID-360と接続したい場合</summary>
+
+### イーサネットを設定します。
+`/etc/netplan/`内に以下の内容のファイルを任意のファイル名で作成してください。拡張子は`.yaml`です。</br>
+また、元からあるファイルは別の場所に移動してください。
+
+```yaml
+network:
+  version: 2
+  renderer: NetworkManager
+  ethernets:
+    # 下の "enXXXXXXXXXXXX" をPCに合わせて変更してください (コマンド「ip a」で、enから始まるポート名) 。
+    enXXXXXXXXXXXX:
+      dhcp4: false
+      addresses: [192.168.1.50/24]  # Livoxと通信するためのPC側のIP
+      optional: true
+```
+
+</br>
+
+### `livox_ros_driver2`の設定ファイルを書き換えます。
+
+1. `./run-docker-containter.sh`でDockerを起動します。
+   
+2. `MID360_config.json`を開きます。
+```
+vim ~/colcon_ws/src/livox_ros_driver2/config/MID360_config.json
+```
+3. `host_net_info`内のipを`192.168.1.50`に変更します。具体的な変更箇所は以下の通りです。
+
+    - `"cmd_data_ip" : "192.168.1.50",`
+    - `"push_msg_ip": "192.168.1.50",`
+    - `"point_data_ip": "192.168.1.50",`
+    - `"imu_data_ip" : "192.168.1.50",`
+
+4. `lidar_configs`のipを以下の手順で変更します。
+
+    - お手元のMID-360のシリアル番号末尾2桁をご確認ください（ここでは例として`15`とします）。
+    - MID-360は`192.168.1.1XX/24`のいずれかに設定されます。（`192.168.1.115`となります）。
+    - `ping 192.168.1.1XX`を実行し、応答があることを確認します。
+    - 応答が確認できたら、`lidar_configs`のipアドレスを変更してください。
+
+<br>
+
+### `launch_ROS2/msg_MID360_launch.py`のパラメータを変更します。
+launchファイルを開きます。
+```bash
+vim ~/colcon_ws/src/livox_ros_driver2/launch_ROS2/msg_MID360_launch.py
+```
+
+</br>
+
+`xfer_format   = 1`を`xfer_format   = 0`にしてください。
+
+</br>
+
+コンテナ内でビルド
+```bash
+cd ~/colcon_ws
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+source ~/colcon_ws/install/setup.bash
+```
+
+</details>
+
+</br>
+
+## ros2_tao_pointpillarsを実行
+`docker_ros2_tao_pointpillars`のコンテナ内で以下を実行。
+```bash
+ros2 launch pp_infer pp_infer_harrp_launch.py
+```
+
+</br>
+
+## HARRPを実行
+`docker_ReID3D2025`のコンテナ内で以下を実行。
+```bash
+terminator
+
+# rviz2
+rviz2 -d ~/colcon_ws/src/harrp/rviz/harrp_kachaka.rviz
+
+# livox_ros_driver2
+ros2 launch livox_ros_driver2 msg_MID360_launch.py
+
+# HARRP
+ros2 launch harrp rviz_harrp_launch.py
+```
+
+</br>
+
+# Author
+金澤 祐典 (金沢工業大学大学院 工学研究科 機械工学専攻 出村研究室)
